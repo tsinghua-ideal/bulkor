@@ -1,0 +1,2 @@
+cargo:rustc-env=TYPENUM_BUILD_CONSTS=/home/lixiang/oram/ToughORAM/enclave/target/debug/build/typenum-6c6e62056da41cf7/out/consts.rs
+cargo:rustc-env=TYPENUM_BUILD_OP=/home/lixiang/oram/ToughORAM/enclave/target/debug/build/typenum-6c6e62056da41cf7/out/op.rs

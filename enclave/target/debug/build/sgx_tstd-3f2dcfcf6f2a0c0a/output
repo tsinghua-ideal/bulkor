@@ -1,0 +1,3 @@
+cargo:rustc-cfg=enable_auto_traits
+cargo:rustc-cfg=derive_macros
+cargo:rustc-cfg=enable_prelude_version
