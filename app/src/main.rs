@@ -22,7 +22,12 @@ use sgx_urts::SgxEnclave;
 #[macro_use]
 extern crate lazy_static;
 use aes::{cipher::NewCipher, Aes256Ctr};
-use aligned_cmov::typenum::{Unsigned, U1024};
+use aligned_cmov::{typenum::{Unsigned, U1024}, A64Bytes};
+use rand_core::{CryptoRng, RngCore, SeedableRng};
+use rand_hc::Hc128Rng;
+
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 mod allocator;
 mod logger;
@@ -37,6 +42,7 @@ type CipherType = Aes256Ctr;
 /// Parameters of the cipher as typedefs (which eases syntax)
 type NonceSize = <CipherType as NewCipher>::NonceSize;
 type KeySize = <CipherType as NewCipher>::KeySize;
+type RngType = Hc128Rng;
 
 type StorageBlockSize = U1024;
 
@@ -44,6 +50,7 @@ static ENCLAVE_FILE: &'static str = "enclave.signed.so";
 
 extern "C" {
     fn ecall_create_oram(eid: sgx_enclave_id_t, retval: *mut u64, n: u64) -> sgx_status_t;
+    fn ecall_destroy_oram(eid: sgx_enclave_id_t) -> sgx_status_t;
     fn ecall_access(
         eid: sgx_enclave_id_t,
         retval: *mut sgx_status_t,
@@ -90,7 +97,7 @@ fn main() {
     };
     log::info!("Finished.");
 
-    let n = 1024;
+    let n = 1<<20;
     let mut retval = n;
     let result = unsafe { ecall_create_oram(enclave.geteid(), &mut retval, n) };
     match result {
@@ -101,35 +108,70 @@ fn main() {
         }
     }
 
-    let mut query = Query::<StorageBlockSize> {
-        op_type: 1,
-        idx: 0,
-        new_val: a64_bytes(1),
-    }
-    .encrypt_to();
-    let query_len = query.len();
-    let resp_len = StorageBlockSize::USIZE + NonceSize::USIZE;
-    let mut resp = vec![0u8; resp_len];
-
-    let mut retval = sgx_status_t::SGX_SUCCESS;
-    let result = unsafe {
-        ecall_access(
-            enclave.geteid(),
-            &mut retval,
-            query.as_mut_ptr(),
-            query_len,
-            resp.as_mut_ptr(),
-            resp_len,
-        )
-    };
-    match result {
-        sgx_status_t::SGX_SUCCESS => {}
-        _ => {
-            println!("[-] ECALL Enclave Failed {}!", result.as_str());
-            return;
-        }
-    }
-    println!("result = {:?}", query::decrypt_res(&mut resp));
+    let mut rng = RngType::from_seed([7u8; 32]);
+    exercise_oram(10000, &mut rng, n, enclave.geteid());
 
     enclave.destroy();
+}
+
+/// Exercise an ORAM by writing, reading, and rewriting, a progressively larger
+/// set of random locations
+pub fn exercise_oram<R>(num_rounds: usize, rng: &mut R, len: u64, eid: sgx_enclave_id_t)
+where
+    R: RngCore + CryptoRng,
+{
+    let mut cur_num_rounds = num_rounds;
+    assert!(len != 0, "len is zero");
+    assert_eq!(len & (len - 1), 0, "len is not a power of two");
+    let mut expected = BTreeMap::<u64, A64Bytes<StorageBlockSize>>::default();
+    let mut probe_positions = Vec::<u64>::new();
+    let mut probe_idx = 0usize;
+
+    let now = Instant::now();
+    while cur_num_rounds > 0 {
+        if probe_idx >= probe_positions.len() {
+            probe_positions.push(rng.next_u64() & (len - 1));
+            probe_idx = 0;
+        }
+        let idx = probe_positions[probe_idx];
+        let mut expected_ent = expected.entry(idx).or_default();
+        rng.fill_bytes(expected_ent);
+
+        let mut query = Query::<StorageBlockSize> {
+            op_type: 1,
+            idx,
+            new_val: expected_ent.clone(),
+        }
+        .encrypt_to();
+        let query_len = query.len();
+        let resp_len = StorageBlockSize::USIZE + NonceSize::USIZE;
+        let mut resp = vec![0u8; resp_len];
+
+        let mut retval = sgx_status_t::SGX_SUCCESS;
+        let result = unsafe {
+            ecall_access(
+                eid,
+                &mut retval,
+                query.as_mut_ptr(),
+                query_len,
+                resp.as_mut_ptr(),
+                resp_len,
+            )
+        };
+        match result {
+            sgx_status_t::SGX_SUCCESS => {}
+            _ => {
+                println!("[-] ECALL Enclave Failed {}!", result.as_str());
+                return;
+            }
+        }
+        //println!("result = {:?}", query::decrypt_res(&mut resp));
+
+        probe_idx += 1;
+        cur_num_rounds -= 1;
+    }
+
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    let per_dur = dur / (num_rounds as f64);
+    println!("total time = {:?}s, time per query = {:?}s", dur, per_dur);
 }

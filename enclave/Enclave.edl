@@ -25,6 +25,7 @@ enclave {
     trusted {
         /* define ECALLs here. */
         public uint64_t ecall_create_oram(uint64_t n);
+        public void ecall_destroy_oram();
         public sgx_status_t ecall_access([in, size=query_len] uint8_t* query, 
                                         size_t query_len,
                                         [out, size=resp_len] uint8_t* resp,

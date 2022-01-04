@@ -112,6 +112,15 @@ pub extern "C" fn ecall_create_oram(n: u64) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn ecall_destroy_oram() {
+    let mut lk = ORAM_OBJ.lock().unwrap();
+    let is_some = lk.is_some();
+    if is_some {
+        let _old_oram = lk.take();  //call the destructor when leaving the scope
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn ecall_access(
     query: *mut u8,
     query_len: usize,
