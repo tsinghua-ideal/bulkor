@@ -1,5 +1,0 @@
-x86_64/getcontext.lo: \
- /home/lixiang/oram/ToughORAM/incubator-teaclave-sgx-sdk/sgx_unwind/../sgx_unwind/libunwind/src/x86_64/getcontext.S \
- /home/lixiang/oram/ToughORAM/incubator-teaclave-sgx-sdk/sgx_unwind/../sgx_unwind/libunwind/src/x86_64/ucontext_i.h
-
-/home/lixiang/oram/ToughORAM/incubator-teaclave-sgx-sdk/sgx_unwind/../sgx_unwind/libunwind/src/x86_64/ucontext_i.h:
