@@ -20,7 +20,7 @@ use std::ops::Mul;
 
 use aligned_cmov::{
     subtle::{Choice, ConstantTimeEq, ConstantTimeLess},
-    typenum::{PartialDiv, Prod, Unsigned, U16, U64, U8},
+    typenum::{PartialDiv, Prod, Unsigned, U64, U8},
     A64Bytes, A8Bytes, ArrayLength, AsAlignedChunks, AsNeSlice, CMov,
 };
 use balanced_tree_index::TreeIndex;
@@ -29,17 +29,21 @@ use rand_core::{CryptoRng, RngCore};
 use crate::oram_traits::{
     log2_ceil, ORAMStorage, ORAMStorageCreator, PositionMap, PositionMapCreator, ORAM,
 };
+use crate::oram_manager::{DataMetaSize, PosMetaSize};
 
 /// In this implementation, a value is expected to be an aligned 4096 byte page.
-/// The metadata associated to a value is two u64's (block num and leaf), so 16
+/// The metadata associated to a value is three u64's (block num, leaf, and counter), so 24
 /// bytes. It is stored separately from the value so as not to break alignment.
 /// In many cases block-num and leaf can be u32's. But I suspect that there will
 /// be other stuff in this metadata as well in the end so the savings isn't
 /// much.
-type MetaSize = U16;
+/// 
+// MetaSize can be U16 for position map ORAM or U24 for data ORAM
+const DATA_META_SIZE: u64 = DataMetaSize::U64;
+const POS_META_SIZE: u64 = PosMetaSize::U64;
 
 // A metadata object is always associated to any Value in the PathORAM
-// structure. A metadata consists of two fields: leaf_num and block_num
+// structure. A metadata consists of three fields: leaf_num, block_num, and counter
 // A metadata has the status of being "vacant" or "not vacant".
 //
 // The block_num is the number in range 0..len that corresponds to the user's
@@ -57,36 +61,74 @@ type MetaSize = U16;
 // A metadata is defined to be "vacant" if leaf_num IS zero.
 // This indicates that the metadata and its corresponding value can be
 // overwritten with a real item.
+// 
+// The counter is used to distinguish stale blocks and up-to-date blocks with the same
+// block_num. It is needed when there exist multiple blocks with the same block_num, as
+// we append the newest block to disk, instead of in-place update. Note that the position
+// map ORAM does not need counter, because we do not persist the position map.
 
 /// Get the leaf num of a metadata
-fn meta_leaf_num(src: &A8Bytes<MetaSize>) -> &u64 {
+fn meta_leaf_num<MetaSize>(src: &A8Bytes<MetaSize>) -> &u64 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
     &src.as_ne_u64_slice()[0]
 }
 /// Get the leaf num of a mutable metadata
-fn meta_leaf_num_mut(src: &mut A8Bytes<MetaSize>) -> &mut u64 {
+fn meta_leaf_num_mut<MetaSize>(src: &mut A8Bytes<MetaSize>) -> &mut u64 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
     &mut src.as_mut_ne_u64_slice()[0]
 }
 /// Get the block num of a metadata
-fn meta_block_num(src: &A8Bytes<MetaSize>) -> &u64 {
+fn meta_block_num<MetaSize>(src: &A8Bytes<MetaSize>) -> &u64 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
     &src.as_ne_u64_slice()[1]
 }
 /// Get the block num of a mutable metadata
-fn meta_block_num_mut(src: &mut A8Bytes<MetaSize>) -> &mut u64 {
+fn meta_block_num_mut<MetaSize>(src: &mut A8Bytes<MetaSize>) -> &mut u64 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
     &mut src.as_mut_ne_u64_slice()[1]
 }
+/// Get the counter of a metadata
+fn meta_counter<MetaSize>(src: &A8Bytes<MetaSize>) -> &u64 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
+    &src.as_ne_u64_slice()[2]
+}
+/// Get the counter of a mutable metadata
+fn meta_counter_mut<MetaSize>(src: &mut A8Bytes<MetaSize>) -> &mut u64 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
+    &mut src.as_mut_ne_u64_slice()[2]
+}
 /// Test if a metadata is "vacant"
-fn meta_is_vacant(src: &A8Bytes<MetaSize>) -> Choice {
+fn meta_is_vacant<MetaSize>(src: &A8Bytes<MetaSize>) -> Choice 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
     meta_leaf_num(src).ct_eq(&0)
 }
 /// Set a metadata to vacant, obliviously, if a condition is true
-fn meta_set_vacant(condition: Choice, src: &mut A8Bytes<MetaSize>) {
+fn meta_set_vacant<MetaSize>(condition: Choice, src: &mut A8Bytes<MetaSize>) 
+where
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+{
     meta_leaf_num_mut(src).cmov(condition, &0);
 }
 
 /// An implementation of PathORAM, using u64 to represent leaves in metadata.
-pub struct PathORAM<ValueSize, Z, StorageType, RngType>
+pub struct PathORAM<ValueSize, MetaSize, Z, StorageType, RngType>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     Z: Unsigned + Mul<ValueSize> + Mul<MetaSize>,
     RngType: RngCore + CryptoRng + Send + Sync + 'static,
     StorageType: ORAMStorage<Prod<Z, ValueSize>, Prod<Z, MetaSize>> + Send + Sync + 'static,
@@ -106,12 +148,13 @@ where
     /// The stashed metadata
     stash_meta: Vec<A8Bytes<MetaSize>>,
     /// Our currently checked-out branch if any
-    branch: BranchCheckout<ValueSize, Z>,
+    branch: BranchCheckout<ValueSize, MetaSize, Z>,
 }
 
-impl<ValueSize, Z, StorageType, RngType> PathORAM<ValueSize, Z, StorageType, RngType>
+impl<ValueSize, MetaSize, Z, StorageType, RngType> PathORAM<ValueSize, MetaSize, Z, StorageType, RngType>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     Z: Unsigned + Mul<ValueSize> + Mul<MetaSize>,
     RngType: RngCore + CryptoRng + Send + Sync + 'static,
     StorageType: ORAMStorage<Prod<Z, ValueSize>, Prod<Z, MetaSize>> + Send + Sync + 'static,
@@ -155,10 +198,11 @@ where
     }
 }
 
-impl<ValueSize, Z, StorageType, RngType> ORAM<ValueSize>
-    for PathORAM<ValueSize, Z, StorageType, RngType>
+impl<ValueSize, MetaSize, Z, StorageType, RngType> ORAM<ValueSize>
+    for PathORAM<ValueSize, MetaSize, Z, StorageType, RngType>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     Z: Unsigned + Mul<ValueSize> + Mul<MetaSize>,
     RngType: RngCore + CryptoRng + Send + Sync + 'static,
     StorageType: ORAMStorage<Prod<Z, ValueSize>, Prod<Z, MetaSize>> + Send + Sync + 'static,
@@ -169,7 +213,7 @@ where
         self.pos.len()
     }
     // TODO: We should try implementing a circuit-ORAM like approach also
-    fn access<T, F: FnOnce(&mut A64Bytes<ValueSize>) -> T>(&mut self, key: u64, f: F) -> T {
+    fn access<T, F: FnOnce(&mut A64Bytes<ValueSize>, &mut u64) -> T>(&mut self, key: u64, f: F) -> T {
         let result: T;
         // Choose what will be the next (secret) position of this item
         let new_pos = 1u64.random_child_at_height(self.height, &mut self.rng);
@@ -206,7 +250,12 @@ where
             debug_assert!(self.branch.leaf == current_pos);
 
             // Call the callback, then store the result
-            result = f(&mut data);
+            // The match here is secure because it is public information 
+            // that whether it is position map ORAM or data ORAM 
+            match MetaSize::U64 == DATA_META_SIZE {
+                true => result = f(&mut data, meta_counter_mut(&mut meta)),
+                false => result = f(&mut data, &mut 0),
+            };
 
             // Set the block_num in case the item was not initialized yet
             *meta_block_num_mut(&mut meta) = key;
@@ -249,9 +298,10 @@ where
 /// call malloc with every checkout.
 ///
 /// This is mainly just an organizational thing.
-struct BranchCheckout<ValueSize, Z>
+struct BranchCheckout<ValueSize, MetaSize, Z>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     Z: Unsigned + Mul<ValueSize> + Mul<MetaSize>,
     Prod<Z, ValueSize>: ArrayLength<u8> + PartialDiv<U8>,
     Prod<Z, MetaSize>: ArrayLength<u8> + PartialDiv<U8>,
@@ -267,9 +317,10 @@ where
     _value_size: PhantomData<fn() -> ValueSize>,
 }
 
-impl<ValueSize, Z> Default for BranchCheckout<ValueSize, Z>
+impl<ValueSize, MetaSize, Z> Default for BranchCheckout<ValueSize, MetaSize, Z>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     Z: Unsigned + Mul<ValueSize> + Mul<MetaSize>,
     Prod<Z, ValueSize>: ArrayLength<u8> + PartialDiv<U8>,
     Prod<Z, MetaSize>: ArrayLength<u8> + PartialDiv<U8>,
@@ -284,9 +335,10 @@ where
     }
 }
 
-impl<ValueSize, Z> BranchCheckout<ValueSize, Z>
+impl<ValueSize, MetaSize, Z> BranchCheckout<ValueSize, MetaSize, Z>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     Z: Unsigned + Mul<ValueSize> + Mul<MetaSize>,
     Prod<Z, ValueSize>: ArrayLength<u8> + PartialDiv<U8>,
     Prod<Z, MetaSize>: ArrayLength<u8> + PartialDiv<U8>,
@@ -443,7 +495,7 @@ where
     ) {
         debug_assert!(dest_data.len() == dest_meta.len());
         for idx in 0..dest_data.len() {
-            details::ct_insert::<ValueSize>(
+            details::ct_insert::<ValueSize, MetaSize>(
                 condition & !(idx as u64).ct_lt(&(insert_after_index as u64)),
                 src_data,
                 src_meta,
@@ -473,14 +525,19 @@ mod details {
     ///            Also set source to vacant.
     ///
     /// The whole operation must be constant time.
-    pub fn ct_find_and_remove<ValueSize: ArrayLength<u8>>(
+    pub fn ct_find_and_remove<ValueSize, MetaSize> 
+    (
         mut condition: Choice,
         query: &u64,
         dest_data: &mut A64Bytes<ValueSize>,
         dest_meta: &mut A8Bytes<MetaSize>,
         src_data: &mut [A64Bytes<ValueSize>],
         src_meta: &mut [A8Bytes<MetaSize>],
-    ) {
+    )     
+    where
+        ValueSize: ArrayLength<u8>, 
+        MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+    {
         debug_assert!(src_data.len() == src_meta.len());
         for idx in 0..src_meta.len() {
             // XXX: Must be constant time and not optimized, may need a better barrier here
@@ -510,13 +567,17 @@ mod details {
     ///            Also set source to vacant.
     ///
     /// The whole operation must be constant time.
-    pub fn ct_insert<ValueSize: ArrayLength<u8>>(
+    pub fn ct_insert<ValueSize, MetaSize>(
         mut condition: Choice,
         src_data: &A64Bytes<ValueSize>,
         src_meta: &mut A8Bytes<MetaSize>,
         dest_data: &mut [A64Bytes<ValueSize>],
         dest_meta: &mut [A8Bytes<MetaSize>],
-    ) {
+    )     
+    where
+        ValueSize: ArrayLength<u8>, 
+        MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+    {
         debug_assert!(dest_data.len() == dest_meta.len());
         condition &= !meta_is_vacant(src_meta);
         for idx in 0..dest_meta.len() {

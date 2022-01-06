@@ -33,9 +33,10 @@ where
         let query = probe_positions[probe_idx];
         let expected_ent = expected.entry(query).or_default();
 
-        oram.access(query, |val| {
+        oram.access(query, |val, counter| {
             assert_eq!(val, expected_ent);
             rng.fill_bytes(val);
+            *counter += 1;
             expected_ent.clone_from_slice(val.as_slice());
         });
 
@@ -61,9 +62,10 @@ where
         let query = num_rounds as u64 & (len - 1);
         let expected_ent = expected.entry(query).or_default();
 
-        oram.access(query, |val| {
+        oram.access(query, |val, counter| {
             assert_eq!(val, expected_ent);
             rng.fill_bytes(val);
+            *counter += 1;
             expected_ent.clone_from_slice(val.as_slice());
         });
 

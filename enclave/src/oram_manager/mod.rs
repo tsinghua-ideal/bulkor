@@ -21,8 +21,11 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
-use crate::oram_traits::{ORAMCreator, ORAMStorageCreator};
-use aligned_cmov::typenum::{U1024, U2, U2048, U32, U4, U4096, U64};
+use crate::oram_traits::{ORAMCreator, ORAMStorageCreator, PositionMap};
+use crate::oram_storage::OcallORAMStorageCreator;
+use aligned_cmov::{
+    typenum::{Prod, U1024, U16, U2, U2048, U24, U32, U4, U4096},
+};
 use rand_core::{CryptoRng, RngCore};
 use std::marker::PhantomData;
 
@@ -32,15 +35,21 @@ pub use position_map::{ORAMU32PositionMap, TrivialPositionMap, U32PositionMapCre
 mod path_oram;
 pub use path_oram::PathORAM;
 
+/// Meta size (see crate::oram_manager::path_oram for detailed explanation)
+type DataMetaSize = U24;
+type PosMetaSize = U16;
+
 /// Creator for PathORAM based on 4096-sized blocks of storage and bucket size
 /// (Z) of 2, and a basic recursive position map implementation
 ///
 /// XXX: This config is broken
 /// (Chris) I sometimes see stash overflow with this config, use Z=4
+/// 
+
 struct PathORAM4096Z2Creator<R, SC>
 where
     R: RngCore + CryptoRng + 'static,
-    SC: ORAMStorageCreator<U4096, U32>,
+    SC: ORAMStorageCreator<U4096, Prod<U2, DataMetaSize>>,
 {
     _rng: PhantomData<fn() -> R>,
     _sc: PhantomData<fn() -> SC>,
@@ -49,9 +58,34 @@ where
 impl<R, SC> ORAMCreator<U2048, R> for PathORAM4096Z2Creator<R, SC>
 where
     R: RngCore + CryptoRng + Send + Sync + 'static,
-    SC: ORAMStorageCreator<U4096, U32>,
+    SC: ORAMStorageCreator<U4096, Prod<U2, DataMetaSize>>,
 {
-    type Output = PathORAM<U2048, U2, SC::Output, R>;
+    type Output = PathORAM<U2048, DataMetaSize, U2, SC::Output, R>;
+
+    fn create<M: 'static + FnMut() -> R>(
+        size: u64,
+        stash_size: usize,
+        rng_maker: &mut M,
+    ) -> Self::Output {
+        PathORAM::new::<U32PositionMapCreator<U2048, R, RecPathORAM4096Z2Creator<R, OcallORAMStorageCreator>>, SC, M>(size, stash_size, rng_maker)
+    }
+}
+
+struct RecPathORAM4096Z2Creator<R, SC>
+where
+    R: RngCore + CryptoRng + 'static,
+    SC: ORAMStorageCreator<U4096, Prod<U2, PosMetaSize>>,
+{
+    _rng: PhantomData<fn() -> R>,
+    _sc: PhantomData<fn() -> SC>,
+}
+
+impl<R, SC> ORAMCreator<U2048, R> for RecPathORAM4096Z2Creator<R, SC>
+where
+    R: RngCore + CryptoRng + Send + Sync + 'static,
+    SC: ORAMStorageCreator<U4096, Prod<U2, PosMetaSize>>,
+{
+    type Output = PathORAM<U2048, PosMetaSize, U2, SC::Output, R>;
 
     fn create<M: 'static + FnMut() -> R>(
         size: u64,
@@ -62,12 +96,14 @@ where
     }
 }
 
+
+
 /// Creator for PathORAM based on 4096-sized blocks of storage and bucket size
 /// (Z) of 4, and a basic recursive position map implementation
 pub struct PathORAM4096Z4Creator<R, SC>
 where
     R: RngCore + CryptoRng + 'static,
-    SC: ORAMStorageCreator<U4096, U64>,
+    SC: ORAMStorageCreator<U4096, Prod<U4, DataMetaSize>>,
 {
     _rng: PhantomData<fn() -> R>,
     _sc: PhantomData<fn() -> SC>,
@@ -76,9 +112,34 @@ where
 impl<R, SC> ORAMCreator<U1024, R> for PathORAM4096Z4Creator<R, SC>
 where
     R: RngCore + CryptoRng + Send + Sync + 'static,
-    SC: ORAMStorageCreator<U4096, U64>,
+    SC: ORAMStorageCreator<U4096, Prod<U4, DataMetaSize>>,
 {
-    type Output = PathORAM<U1024, U4, SC::Output, R>;
+    type Output = PathORAM<U1024, DataMetaSize, U4, SC::Output, R>;
+
+    fn create<M: 'static + FnMut() -> R>(
+        size: u64,
+        stash_size: usize,
+        rng_maker: &mut M,
+    ) -> Self::Output {
+        PathORAM::new::<U32PositionMapCreator<U1024, R, RecPathORAM4096Z4Creator<R, OcallORAMStorageCreator>>, SC, M>(size, stash_size, rng_maker)
+    }
+}
+
+pub struct RecPathORAM4096Z4Creator<R, SC>
+where
+    R: RngCore + CryptoRng + 'static,
+    SC: ORAMStorageCreator<U4096, Prod<U4, PosMetaSize>>,
+{
+    _rng: PhantomData<fn() -> R>,
+    _sc: PhantomData<fn() -> SC>,
+}
+
+impl<R, SC> ORAMCreator<U1024, R> for RecPathORAM4096Z4Creator<R, SC>
+where
+    R: RngCore + CryptoRng + Send + Sync + 'static,
+    SC: ORAMStorageCreator<U4096, Prod<U4, PosMetaSize>>,
+{
+    type Output = PathORAM<U1024, PosMetaSize, U4, SC::Output, R>;
 
     fn create<M: 'static + FnMut() -> R>(
         size: u64,

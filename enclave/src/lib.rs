@@ -43,7 +43,7 @@ use aes::{
     cipher::{NewCipher, StreamCipher},
     Aes256Ctr,
 };
-use aligned_cmov::{typenum::{U1024, U4, U4096, U64, Unsigned}, CMov};
+use aligned_cmov::{typenum::{U1024, U24, U4, U4096, U96, Unsigned}, CMov};
 
 mod allocator;
 use allocator::Allocator;
@@ -74,18 +74,20 @@ type NonceSize = <CipherType as NewCipher>::NonceSize;
 type KeySize = <CipherType as NewCipher>::KeySize;
 /// Sometimes you need to have the type in scope to call trait functions
 type RngType = Hc128Rng;
-/// Parameters that correspond to PathORAM4096Z4Creator
+/// Parameters that correspond to PathORAM4096Z4Creator, should be consist with crate::oram_manager (DataMetaSize)
 type StorageBlockSize = U1024;
+type StorageBlockMetaSize = U24;
 type StorageBucketSize = U4096;
+type StorageBucketMetaSize = U96;  //MetaSize(24)*Z(4)
 type StorageZ = U4;
-type StorageMetaSize = U64;
 const STASH_SIZE: usize = 16;
-/// Bucket size = U4096, Z = U4, MetaSize = U64
+/// Bucket size = U4096, Z = U4, MetaSize = U96
 type ORAMCreatorClass = PathORAM4096Z4Creator<RngType, OcallORAMStorageCreator>;
 type ORAMClass = PathORAM<
     StorageBlockSize,
+    StorageBlockMetaSize,
     StorageZ,
-    OcallORAMStorage<StorageBucketSize, StorageMetaSize>,
+    OcallORAMStorage<StorageBucketSize, StorageBucketMetaSize>,
     RngType,
 >;
 
@@ -136,9 +138,10 @@ pub extern "C" fn ecall_access(
     } = Query::<StorageBlockSize>::decrypt_from(bytes);
     let mut lk = ORAM_OBJ.lock().unwrap();
     let cur_oram = lk.as_mut().unwrap();
-    let mut data = cur_oram.access(idx, |val| {
+    let mut data = cur_oram.access(idx, |val, counter| {
         let retval = val.clone();
         val.cmov(op_type, &new_val);
+        counter.cmov(op_type, &(*counter+1));
         retval
     });
 

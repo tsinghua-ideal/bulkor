@@ -126,7 +126,7 @@ where
         let upper_key = *key >> Self::L;
         let lower_key = (*key as u32) & ((1u32 << Self::L) - 1);
 
-        let mut old_val = self.oram.access(upper_key, |block| -> u32 {
+        let mut old_val = self.oram.access(upper_key, |block, _counter| -> u32 {
             let mut old_val = 0u32;
             let u32_slice = block.as_mut_ne_u32_slice();
             for idx in 0..(1u32 << Self::L) {

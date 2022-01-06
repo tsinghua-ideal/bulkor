@@ -123,7 +123,7 @@ pub trait ORAM<ValueSize: ArrayLength<u8>> {
     ///
     /// This is the lowest-level API that we offer for getting data from the
     /// ORAM.
-    fn access<T, F: FnOnce(&mut A64Bytes<ValueSize>) -> T>(&mut self, index: u64, func: F) -> T;
+    fn access<T, F: FnOnce(&mut A64Bytes<ValueSize>, &mut u64) -> T>(&mut self, index: u64, func: F) -> T;
 
     /// High-level helper -- when you only need to read and don't need to write
     /// a new value, this is simpler than using `access`.
@@ -131,7 +131,7 @@ pub trait ORAM<ValueSize: ArrayLength<u8>> {
     /// this.
     #[inline]
     fn read(&mut self, index: u64) -> A64Bytes<ValueSize> {
-        self.access(index, |val| val.clone())
+        self.access(index, |val, counter| val.clone())
     }
 
     /// High-level helper -- when you need to write a value and want the
@@ -141,9 +141,10 @@ pub trait ORAM<ValueSize: ArrayLength<u8>> {
     /// this.
     #[inline]
     fn write(&mut self, index: u64, new_val: &A64Bytes<ValueSize>) -> A64Bytes<ValueSize> {
-        self.access(index, |val| {
+        self.access(index, |val, counter| {
             let retval = val.clone();
             *val = new_val.clone();
+            *counter += 1;
             retval
         })
     }
