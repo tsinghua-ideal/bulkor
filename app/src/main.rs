@@ -97,7 +97,7 @@ fn main() {
     };
     log::info!("Finished.");
 
-    let n = 1<<20;
+    let n = 8<<20;  //8M*1KB
     let mut retval = n;
     let result = unsafe { ecall_create_oram(enclave.geteid(), &mut retval, n) };
     match result {

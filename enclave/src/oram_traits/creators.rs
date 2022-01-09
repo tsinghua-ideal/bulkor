@@ -65,6 +65,7 @@ pub trait ORAMStorageCreator<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u
     /// It is expected that all storage will be zeroed from the caller's point
     /// of view, the first time that they access any of it.
     fn create<R: RngCore + CryptoRng>(
+        level: u32,
         size: u64,
         csprng: &mut R,
     ) -> Result<Self::Output, Self::Error>;

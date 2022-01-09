@@ -28,6 +28,7 @@ impl<ValueSize> Query<ValueSize>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
 {
+    /// decrypt the query sent by user
     pub fn decrypt_from(bytes: &mut [u8]) -> Query<ValueSize> {
         let mut aes_nonce = CipherGenericArray::<u8, NonceSize>::default();
         let ns = NonceSize::USIZE;
@@ -46,6 +47,24 @@ where
             new_val,
         }
     }
+
+    //encrypt the query for logging
+    pub fn encrypt_with_counter(&self, cur_counter: u64) -> Vec<u8> {
+        let ns = NonceSize::USIZE;
+        let mut bytes = vec![1u8; ns];  //insecure, the nonce should be changed in production
+        bytes.push(self.op_type.unwrap_u8());
+        bytes.extend_from_slice(&self.idx.to_le_bytes());
+        bytes.extend_from_slice(&self.new_val);
+        bytes.extend_from_slice(&cur_counter.to_le_bytes());
+        let mut aes_nonce = CipherGenericArray::<u8, NonceSize>::default();
+        aes_nonce[0..ns].copy_from_slice(&bytes[0..ns]);
+        let mut cipher = CipherType::new(&QUERY_KEY, &aes_nonce);
+        cipher.apply_keystream(&mut bytes[ns..(ns + 1)]); //op_type
+        cipher.apply_keystream(&mut bytes[(ns + 1)..(ns + 9)]); //idx
+        cipher.apply_keystream(&mut bytes[(ns + 9)..(ns + 9 + ValueSize::USIZE)]); // block
+        cipher.apply_keystream(&mut bytes[(ns + 9 + ValueSize::USIZE)..(ns + 17 + ValueSize::USIZE)]); // counter
+        bytes
+    }
 }
 
 /// The result is encrypted in-place, the returned value is the nonce
@@ -60,4 +79,17 @@ where
     let mut cipher = CipherType::new(&QUERY_KEY, &aes_nonce);
     cipher.apply_keystream(res); // block
     bytes
+}
+
+pub struct Logger {
+    buf: Vec<u8>,
+}
+
+impl Logger {
+    pub fn new() -> Self {
+        Logger { buf: Vec::new() }
+    }
+    pub fn insert<ValueSize>(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
 }

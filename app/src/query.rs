@@ -24,6 +24,7 @@ impl<ValueSize> Query<ValueSize>
 where
     ValueSize: ArrayLength<u8> + PartialDiv<U8> + PartialDiv<U64>,
 {
+    /// encrypt the query to be sent to enclave
     pub fn encrypt_to(&self) -> Vec<u8> {
         let ns = NonceSize::USIZE;
         let mut bytes = vec![1u8; ns];  //insecure, the nonce should be changed in production

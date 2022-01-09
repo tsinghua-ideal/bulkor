@@ -38,8 +38,28 @@
 use std::{
     alloc::{alloc, alloc_zeroed, dealloc, Layout},
     boxed::Box,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    cmp::max,
+    fs::{remove_file, File, OpenOptions},
+    io::{self, BufWriter, Read, Write},
+    os::unix::fs::FileExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
+
+lazy_static! {
+    /// The tree-top caching threshold, specified as log2 of a number of bytes.
+    ///
+    /// This is the approximate number of bytes that can be stored on the heap in the untrusted memory
+    /// for a single ORAM storage object.
+    ///
+    /// This is expected to be tuned as a function of
+    /// (1) number of (recursive) ORAM's needed
+    /// (2) untrusted memory heap size, set at build time
+    ///
+    /// Changing this number influences any ORAM storage objects created after the change,
+    /// but not before. So, it should normally be changed during enclave init, if at all.
+    pub static ref TREETOP_CACHING_THRESHOLD_LOG2 : AtomicU32 = AtomicU32::new(33u32); // 8 GB
+}
 
 /// Resources held on untrusted side in connection to an allocation request by
 /// enclave
@@ -48,15 +68,23 @@ use std::{
 /// thing exported by the crate is the enclave EDL functions
 struct UntrustedAllocation {
     /// The number of data and meta items stored in this allocation
-    count: usize,
+    count_in_mem: usize,
+    // The maximum count for the treetop storage in untrusted memory,
+    // based on what we loaded from TREETOP_CACHING_THRESHOLD_LOG2 at construction time
+    // This must never change after construction.
+    treetop_max_count: u64,
     /// The size of a data item in bytes
     data_item_size: usize,
     /// The size of a meta item in bytes
     meta_item_size: usize,
     /// The pointer to the data items
-    data_pointer: *mut u64,
+    data_pointer: *mut u8,
     /// The pointer to the meta items
-    meta_pointer: *mut u64,
+    meta_pointer: *mut u8,
+    /// The file descriptor for data file
+    data_file: File,
+    /// The file descriptor for meta file
+    meta_file: File, 
     /// A flag set to true when a thread is in the critical section and released
     /// when it leaves. This is used to trigger assertions if there is a
     /// race happening on this API This is simpler and less expensive than
@@ -85,10 +113,19 @@ impl UntrustedAllocation {
     ///
     /// Data and meta item sizes must be divisible by 8, consistent with the
     /// contract described in the edl file
-    pub fn new(count: usize, data_item_size: usize, meta_item_size: usize) -> Self {
-        let mem_kb = compute_mem_kb(count, data_item_size, meta_item_size);
+    pub fn new(level: u32, count: usize, data_item_size: usize, meta_item_size: usize) -> Self {
+        let treetop_max_count: u64 = max(
+            2u64,
+            (1u64 << TREETOP_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) / data_item_size as u64,
+        );
+        let count_in_mem= if count <= treetop_max_count as usize {
+            count
+        } else {
+            treetop_max_count as usize
+        };
+        let mem_kb = compute_mem_kb(count_in_mem, data_item_size, meta_item_size);
         let total_mem_kb = mem_kb + TOTAL_MEM_FOOTPRINT_KB.fetch_add(mem_kb, Ordering::SeqCst);
-        log::info!("Untrusted is allocating oram storage: count = {}, data_size = {}, meta_size = {}, mem = {} KB. Total mem allocated this way = {} KB", count, data_item_size, meta_item_size, mem_kb, total_mem_kb);
+        log::info!("Untrusted is allocating oram storage: count_in_mem = {}, count_on_disk = {}, data_size = {}, meta_size = {}, mem = {} KB. Total mem allocated this way = {} KB", count_in_mem, count, data_item_size, meta_item_size, mem_kb, total_mem_kb);
         assert!(
             data_item_size % 8 == 0,
             "data item size is not good: {}",
@@ -100,34 +137,58 @@ impl UntrustedAllocation {
             meta_item_size
         );
 
+        let data_file_name = PathBuf::from("data_".to_string() + &level.to_string());
+        let meta_file_name = PathBuf::from("meta_".to_string() + &level.to_string());
+        let mut data_file = OpenOptions::new().create(true).write(true).read(true).open(&data_file_name).unwrap();
+        let mut meta_file = OpenOptions::new().create(true).write(true).read(true).open(&meta_file_name).unwrap();
+
         let data_pointer = unsafe {
-            alloc(Layout::from_size_align(count * data_item_size, 8).unwrap()) as *mut u64
+            alloc(Layout::from_size_align(count_in_mem * data_item_size, 8).unwrap())
         };
         if data_pointer.is_null() {
             panic!(
                 "Could not allocate memory for data segment: {}",
-                count * data_item_size
+                count_in_mem * data_item_size
             )
         }
         let meta_pointer = unsafe {
-            alloc_zeroed(Layout::from_size_align(count * meta_item_size, 8).unwrap()) as *mut u64
+            alloc_zeroed(Layout::from_size_align(count_in_mem * meta_item_size, 8).unwrap())
         };
         if meta_pointer.is_null() {
             panic!(
                 "Could not allocate memory for meta segment: {}",
-                count * meta_item_size
+                count_in_mem * meta_item_size
             )
         }
+
+        let mut data_file_len = data_file.metadata().unwrap().len() as usize;
+        let mut meta_file_len = meta_file.metadata().unwrap().len() as usize;
+        assert!(data_file_len == meta_file_len, "data_file_len should be consistent with meta_file_len");
+        // Initialization is not finished, so do the initialization
+        let zeros = vec![0u8; data_item_size];
+        while data_file_len < count * data_item_size {
+            data_file.write_all(&zeros).unwrap();
+            data_file_len += data_item_size;
+        }
+        while meta_file_len < count * meta_item_size {
+            meta_file.write_all(&zeros[..meta_item_size]).unwrap();
+            meta_file_len += meta_item_size;
+        }
+        data_file.flush().unwrap();
+        meta_file.flush().unwrap();
 
         let critical_section_flag = AtomicBool::new(false);
         let checkout_flag = AtomicBool::new(false);
 
         Self {
-            count,
+            count_in_mem,
+            treetop_max_count,
             data_item_size,
             meta_item_size,
             data_pointer,
             meta_pointer,
+            data_file,
+            meta_file,
             critical_section_flag,
             checkout_flag,
         }
@@ -139,13 +200,13 @@ impl Drop for UntrustedAllocation {
         unsafe {
             dealloc(
                 self.data_pointer as *mut u8,
-                Layout::from_size_align_unchecked(self.count * self.data_item_size, 8),
+                Layout::from_size_align_unchecked(self.count_in_mem * self.data_item_size, 8),
             );
             dealloc(
                 self.meta_pointer as *mut u8,
-                Layout::from_size_align_unchecked(self.count * self.meta_item_size, 8),
+                Layout::from_size_align_unchecked(self.count_in_mem * self.meta_item_size, 8),
             );
-            let mem_kb = compute_mem_kb(self.count, self.data_item_size, self.meta_item_size);
+            let mem_kb = compute_mem_kb(self.count_in_mem, self.data_item_size, self.meta_item_size);
             TOTAL_MEM_FOOTPRINT_KB.fetch_sub(mem_kb, Ordering::SeqCst);
         }
     }
@@ -159,12 +220,14 @@ impl Drop for UntrustedAllocation {
 /// id_out must be a valid pointer to a u64
 #[no_mangle]
 pub unsafe extern "C" fn allocate_oram_storage(
+    level: u32,
     count: u64,
     data_size: u64,
     meta_size: u64,
     id_out: *mut u64,
 ) {
     let result = Box::new(UntrustedAllocation::new(
+        level,
         count as usize,
         data_size as usize,
         meta_size as usize,
@@ -198,10 +261,10 @@ pub unsafe extern "C" fn release_oram_storage(id: u64) {
 ///
 /// id must be a valid id previously returned by allocate_oram_storage
 ///
-/// databuf_len must be equal to idx_len * data_item_size / 8,
+/// databuf_len must be equal to idx_len * data_item_size,
 /// where data_item_size was passed when allocating storage.
 ///
-/// metabuf_len must be equal to idx_len * meta_item_size / 8,
+/// metabuf_len must be equal to idx_len * meta_item_size,
 /// where meta_item_size was passed when allocating storage.
 ///
 /// All indices must be in bounds, less than count that was passed when
@@ -211,9 +274,9 @@ pub unsafe extern "C" fn checkout_oram_storage(
     id: u64,
     idx: *const u64,
     idx_len: usize,
-    databuf: *mut u64,
+    databuf: *mut u8,
     databuf_len: usize,
-    metabuf: *mut u64,
+    metabuf: *mut u8,
     metabuf_len: usize,
 ) {
     #[cfg(debug_assertions)]
@@ -228,32 +291,44 @@ pub unsafe extern "C" fn checkout_oram_storage(
         "illegal checkout"
     );
 
-    // The size of a data_item, measured in u64's
-    let data_copy_size = (*ptr).data_item_size / core::mem::size_of::<u64>();
-    // The size of a meta_item, measured in u64's
-    let meta_copy_size = (*ptr).meta_item_size / core::mem::size_of::<u64>();
-
-    assert!(idx_len * data_copy_size == databuf_len);
-    assert!(idx_len * meta_copy_size == metabuf_len);
+    let data_item_size = (*ptr).data_item_size;
+    let meta_item_size = (*ptr).meta_item_size;
+    assert!(idx_len * data_item_size == databuf_len);
+    assert!(idx_len * meta_item_size == metabuf_len);
 
     let indices = core::slice::from_raw_parts(idx, idx_len);
+    let databuf_s = core::slice::from_raw_parts_mut(databuf, databuf_len);
+    let metabuf_s = core::slice::from_raw_parts_mut(metabuf, metabuf_len);
+
+    let first_treetop_index = indices
+        .iter()
+        .position(|idx| idx < &(*ptr).treetop_max_count)
+        .expect("should be unreachable, at least one thing should be in the treetop");
 
     for (count, index) in indices.iter().enumerate() {
         let index = *index as usize;
-        core::ptr::copy_nonoverlapping(
-            (*ptr).data_pointer.add(data_copy_size * index),
-            databuf.add(data_copy_size * count),
-            data_copy_size,
-        );
+        if count < first_treetop_index {
+            (*ptr).data_file.read_exact_at(&mut databuf_s[data_item_size * count..data_item_size * (count + 1)], (data_item_size * index) as u64).unwrap();
+        } else {
+            core::ptr::copy_nonoverlapping(
+                (*ptr).data_pointer.add(data_item_size * index),
+                databuf.add(data_item_size * count),
+                data_item_size,
+            );
+        }
     }
 
     for (count, index) in indices.iter().enumerate() {
         let index = *index as usize;
-        core::ptr::copy_nonoverlapping(
-            (*ptr).meta_pointer.add(meta_copy_size * index),
-            metabuf.add(meta_copy_size * count),
-            meta_copy_size,
-        );
+        if count < first_treetop_index {
+            (*ptr).meta_file.read_exact_at(&mut metabuf_s[meta_item_size * count..meta_item_size * (count + 1)], (meta_item_size * index) as u64).unwrap();
+        } else {
+            core::ptr::copy_nonoverlapping(
+                (*ptr).meta_pointer.add(meta_item_size * index),
+                metabuf.add(meta_item_size * count),
+                meta_item_size,
+            );
+        }
     }
 
     assert!(
@@ -270,10 +345,10 @@ pub unsafe extern "C" fn checkout_oram_storage(
 ///
 /// id must be a valid id previously returned by allocate_oram_storage
 ///
-/// databuf_len must be equal to idx_len * data_item_size / 8,
+/// databuf_len must be equal to idx_len * data_item_size,
 /// where data_item_size was passed when allocating storage.
 ///
-/// metabuf_len must be equal to idx_len * meta_item_size / 8,
+/// metabuf_len must be equal to idx_len * meta_item_size,
 /// where meta_item_size was passed when allocating storage.
 ///
 /// All indices must be in bounds, less than count that was passed when
@@ -283,9 +358,9 @@ pub unsafe extern "C" fn checkin_oram_storage(
     id: u64,
     idx: *const u64,
     idx_len: usize,
-    databuf: *const u64,
+    databuf: *const u8,
     databuf_len: usize,
-    metabuf: *const u64,
+    metabuf: *const u8,
     metabuf_len: usize,
 ) {
     #[cfg(debug_assertions)]
@@ -300,32 +375,46 @@ pub unsafe extern "C" fn checkin_oram_storage(
         "illegal checkin"
     );
 
-    // The size of a data_item, measured in u64's
-    let data_copy_size = (*ptr).data_item_size / core::mem::size_of::<u64>();
-    // The size of a meta_item, measured in u64's
-    let meta_copy_size = (*ptr).meta_item_size / core::mem::size_of::<u64>();
-
-    assert!(idx_len * data_copy_size == databuf_len);
-    assert!(idx_len * meta_copy_size == metabuf_len);
+    let data_item_size = (*ptr).data_item_size;
+    let meta_item_size = (*ptr).meta_item_size;
+    assert!(idx_len * data_item_size == databuf_len);
+    assert!(idx_len * meta_item_size == metabuf_len);
 
     let indices = core::slice::from_raw_parts(idx, idx_len);
+    let databuf_s = core::slice::from_raw_parts(databuf, databuf_len);
+    let metabuf_s = core::slice::from_raw_parts(metabuf, metabuf_len);
 
+    let first_treetop_index = indices
+        .iter()
+        .position(|idx| idx < &(*ptr).treetop_max_count)
+        .expect("should be unreachable, at least one thing should be in the treetop");
+
+    // First step: Do the part that's on the disk
+    // Second step: Do the part that's in the treetop
     for (count, index) in indices.iter().enumerate() {
         let index = *index as usize;
-        core::ptr::copy_nonoverlapping(
-            databuf.add(data_copy_size * count),
-            (*ptr).data_pointer.add(data_copy_size * index),
-            data_copy_size,
-        );
+        if count < first_treetop_index {
+            (*ptr).data_file.write_all_at(&databuf_s[data_item_size * count..data_item_size * (count + 1)], (data_item_size * index) as u64).unwrap();
+        } else {
+            core::ptr::copy_nonoverlapping(
+                databuf.add(data_item_size * count),
+                (*ptr).data_pointer.add(data_item_size * index),
+                data_item_size,
+            );
+        }
     }
 
     for (count, index) in indices.iter().enumerate() {
         let index = *index as usize;
-        core::ptr::copy_nonoverlapping(
-            metabuf.add(meta_copy_size * count),
-            (*ptr).meta_pointer.add(meta_copy_size * index),
-            meta_copy_size,
-        );
+        if count < first_treetop_index {
+            (*ptr).meta_file.write_all_at(&metabuf_s[meta_item_size * count..meta_item_size * (count + 1)], (meta_item_size * index) as u64).unwrap();
+        } else {
+            core::ptr::copy_nonoverlapping(
+                metabuf.add(meta_item_size * count),
+                (*ptr).meta_pointer.add(meta_item_size * index),
+                meta_item_size,
+            );
+        }
     }
 
     assert!(

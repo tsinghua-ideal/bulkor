@@ -11,6 +11,8 @@ use balanced_tree_index::TreeIndex;
 
 /// The HeapORAMStorage is simply vector
 pub struct HeapORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> {
+    /// The current level of recursive ORAM
+    level: u32,
     /// The storage for the blocks
     data: Vec<A64Bytes<BlockSize>>,
     /// The storage for the metadata
@@ -21,8 +23,9 @@ pub struct HeapORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>
 }
 
 impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> HeapORAMStorage<BlockSize, MetaSize> {
-    pub fn new(size: u64) -> Self {
+    pub fn new(level: u32, size: u64) -> Self {
         Self {
+            level,
             data: vec![Default::default(); size as usize],
             metadata: vec![Default::default(); size as usize],
             checkout_index: None,
@@ -89,10 +92,11 @@ impl<BlockSize: ArrayLength<u8> + 'static, MetaSize: ArrayLength<u8> + 'static>
     type Error = HeapORAMStorageCreatorError;
 
     fn create<R: RngCore + CryptoRng>(
+        level: u32,
         size: u64,
         _rng: &mut R,
     ) -> Result<Self::Output, Self::Error> {
-        Ok(Self::Output::new(size))
+        Ok(Self::Output::new(level, size))
     }
 }
 

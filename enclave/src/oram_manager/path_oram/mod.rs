@@ -17,6 +17,7 @@ use std::boxed::Box;
 use std::vec::Vec;
 use std::marker::PhantomData;
 use std::ops::Mul;
+use std::sync::atomic::Ordering;
 
 use aligned_cmov::{
     subtle::{Choice, ConstantTimeEq, ConstantTimeLess},
@@ -30,6 +31,7 @@ use crate::oram_traits::{
     log2_ceil, ORAMStorage, ORAMStorageCreator, PositionMap, PositionMapCreator, ORAM,
 };
 use crate::oram_manager::{DataMetaSize, PosMetaSize};
+use crate::oram_storage::MAX_LEVEL;
 
 /// In this implementation, a value is expected to be an aligned 4096 byte page.
 /// The metadata associated to a value is three u64's (block num, leaf, and counter), so 24
@@ -135,6 +137,9 @@ where
     Prod<Z, ValueSize>: ArrayLength<u8> + PartialDiv<U8>,
     Prod<Z, MetaSize>: ArrayLength<u8> + PartialDiv<U8>,
 {
+    /// The current level of recursive ORAM. If 0, it is data oram. 
+    /// Otherwise it is position map oram. 
+    level: u32, 
     /// The height of the binary tree used for storage
     height: u32,
     /// The storage itself
@@ -180,13 +185,16 @@ where
         assert!(size & (size - 1) == 0, "size must be a power of two");
         // saturating_sub is used so that creating an ORAM of size 1 or 2 doesn't fail
         let height = log2_ceil(size).saturating_sub(log2_ceil(Z::U64));
+        let level = MAX_LEVEL.fetch_add(1, Ordering::SeqCst);
+        println!("current level = {:?}", level);
         // This is 2u64 << height because it must be 2^{h+1}, we have defined
         // the height of the root to be 0, so in a tree where the lowest level
         // is h, there are 2^{h+1} nodes.
         let mut rng = rng_maker();
-        let storage = SC::create(2u64 << height, &mut rng).expect("Storage failed");
+        let storage = SC::create(level, 2u64 << height, &mut rng).expect("Storage failed");
         let pos = PMC::create(size, height, stash_size, rng_maker);
         Self {
+            level,
             height,
             storage,
             pos,
@@ -252,9 +260,12 @@ where
             // Call the callback, then store the result
             // The match here is secure because it is public information 
             // that whether it is position map ORAM or data ORAM 
-            match MetaSize::U64 == DATA_META_SIZE {
-                true => result = f(&mut data, meta_counter_mut(&mut meta)),
-                false => result = f(&mut data, &mut 0),
+            if MetaSize::U64 == DATA_META_SIZE {
+                result = f(&mut data, meta_counter_mut(&mut meta));
+            } else if MetaSize::U64 == POS_META_SIZE {
+                result = f(&mut data, &mut 0);
+            } else {
+                panic!("MetaSize {:?} is invalid", MetaSize::U64);
             };
 
             // Set the block_num in case the item was not initialized yet

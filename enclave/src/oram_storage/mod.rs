@@ -60,7 +60,7 @@ lazy_static! {
     ///
     /// Changing this number influences any ORAM storage objects created after the change,
     /// but not before. So, it should normally be changed during enclave init, if at all.
-    pub static ref TREETOP_CACHING_THRESHOLD_LOG2 : AtomicU32 = AtomicU32::new(25u32); // 32 MB
+    pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(25u32); // 32 MB
 
     // An extra mutex which we lock across our OCALLs, this is done to detect if the untrusted
     // attacker does strange things.
@@ -86,6 +86,9 @@ lazy_static! {
     // only have one OMAP object, and its API is &mut, so the caller must wrap it in a mutex anyways,
     // and this is unlikely to change.
     static ref OCALL_REENTRANCY_MUTEX: Mutex<()> = Mutex::new(());
+    
+    // The maximum level of created ORAM, up to now.
+    pub static ref MAX_LEVEL: AtomicU32 = AtomicU32::new(0u32);
 }
 
 // Make an aes nonce per the docu
@@ -105,12 +108,14 @@ where
     MetaSize: ArrayLength<u8> + Add<ExtraMetaSize>,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
 {
+    /// The current level of recursive ORAM
+    level: u32,
     // The id returned from untrusted for the untrusted-side storage if any, or 0 if none.
     allocation_id: u64,
     // The size of the binary tree the caller asked us to provide storage for, must be a power of
     // two
     count: u64,
-    // The maximum count for the treetop storage,
+    // The maximum count for the treetop storage in trusted memory,
     // based on what we loaded from TREETOP_CACHING_THRESHOLD_LOG2 at construction time
     // This must never change after construction.
     treetop_max_count: u64,
@@ -135,7 +140,7 @@ where
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
 {
     /// Create a new oram storage object for count items, with particular RNG
-    pub fn new<Rng: RngCore + CryptoRng>(count: u64, rng: &mut Rng) -> Self {
+    pub fn new<Rng: RngCore + CryptoRng>(level: u32, count: u64, rng: &mut Rng) -> Self {
         assert!(count != 0);
         assert!(count & (count - 1) == 0, "count must be a power of two");
 
@@ -145,15 +150,11 @@ where
         );
 
         let mut allocation_id = 0u64;
-        let treetop = if count <= treetop_max_count {
-            // eprintln!("count = {} <= TREETOP_MAX_COUNT = {}", count, treetop_max_count);
-            HeapORAMStorage::new(count)
-        } else {
-            // eprintln!("count = {} > TREETOP_MAX_COUNT = {}, we must allocate in
-            // untrusted", count, treetop_max_count);
+        let treetop = {
             unsafe {
                 allocate_oram_storage(
-                    count - treetop_max_count,
+                    level,
+                    count,
                     DataSize::U64,
                     MetaSize::U64 + ExtraMetaSize::U64,
                     &mut allocation_id,
@@ -161,12 +162,17 @@ where
             }
             if allocation_id == 0 {
                 panic!("Untrusted could not allocate storage! count = {}, data_size = {}, meta_size + extra_meta_size = {}",
-                       count - treetop_max_count,
+                       count,
                        DataSize::U64,
                        MetaSize::U64 + ExtraMetaSize::U64)
             }
-            HeapORAMStorage::new(treetop_max_count)
+            if count <= treetop_max_count {
+                HeapORAMStorage::new(level, count)
+            } else {
+                HeapORAMStorage::new(level,treetop_max_count)
+            }
         };
+        println!("Finish ORAM allocation");
 
         let trusted_merkle_roots = if count <= treetop_max_count {
             Default::default()
@@ -180,6 +186,7 @@ where
         rng.fill_bytes(hash_key.as_mut_slice());
 
         Self {
+            level,
             allocation_id,
             count,
             treetop_max_count,
@@ -252,10 +259,11 @@ where
         // Now do the part that's not in the treetop
         // If first_treetop_index == 0 then everything is in the treetop
         if first_treetop_index > 0 {
-            // Subtract treetop_max_count from indices before sending to untrusted
-            for idx in &mut indices[..first_treetop_index] {
-                *idx -= self.treetop_max_count;
-            }
+            // For persist ORAM, it should not allow to subtract treetop_max_count 
+            // from indices before sending to untrusted
+            // for idx in &mut indices[..first_treetop_index] {
+            //     *idx -= self.treetop_max_count;
+            // }
             self.meta_scratch_buffer
                 .resize_with(first_treetop_index, Default::default);
 
@@ -270,11 +278,11 @@ where
                     &mut self.meta_scratch_buffer,
                 );
             }
-            // Add treetop_max_count back to indices so that our calculations will be
-            // correct
-            for idx in &mut indices[..first_treetop_index] {
-                *idx += self.treetop_max_count;
-            }
+            // For persist ORAM, it does not need to add treetop_max_count back to 
+            // indices so that our calculations will be correct
+            // for idx in &mut indices[..first_treetop_index] {
+            //     *idx += self.treetop_max_count;
+            // }
 
             // We have to decrypt, checking the macs in the meta scratch buffer, and
             // ultimately set dest_meta[idx]
@@ -434,10 +442,11 @@ where
             self.trusted_merkle_roots[last_idx as usize] = last_hash;
 
             // All extra-metas are done, now send it to untrusted for storage
-            // Subtract treetop_max_count from indices before sending to untrusted
-            for idx in &mut indices[..first_treetop_index] {
-                *idx -= self.treetop_max_count;
-            }
+            // For persist ORAM, it should not allow to subtract treetop_max_count 
+            // from indices before sending to untrusted
+            // for idx in &mut indices[..first_treetop_index] {
+            //     *idx -= self.treetop_max_count;
+            // }
             let _lk = OCALL_REENTRANCY_MUTEX
                 .lock()
                 .expect("could not lock our mutex");
@@ -464,10 +473,11 @@ where
     type Error = UntrustedStorageError;
 
     fn create<Rng: RngCore + CryptoRng>(
+        level: u32,
         size: u64,
         rng: &mut Rng,
     ) -> Result<Self::Output, Self::Error> {
-        Ok(Self::Output::new(size, rng))
+        Ok(Self::Output::new(level, size, rng))
     }
 }
 
@@ -500,10 +510,10 @@ mod helpers {
                 id,
                 idx.as_ptr(),
                 idx.len(),
-                data.as_mut_ptr() as *mut u64,
-                data.len() * DataSize::USIZE / 8,
-                meta.as_mut_ptr() as *mut u64,
-                meta.len() * MetaSize::USIZE / 8,
+                data.as_mut_ptr() as *mut u8,
+                data.len() * DataSize::USIZE,
+                meta.as_mut_ptr() as *mut u8,
+                meta.len() * MetaSize::USIZE,
             )
         }
     }
@@ -524,10 +534,10 @@ mod helpers {
                 id,
                 idx.as_ptr(),
                 idx.len(),
-                data.as_ptr() as *const u64,
-                data.len() * DataSize::USIZE / 8,
-                meta.as_ptr() as *const u64,
-                meta.len() * MetaSize::USIZE / 8,
+                data.as_ptr() as *const u8,
+                data.len() * DataSize::USIZE,
+                meta.as_ptr() as *const u8,
+                meta.len() * MetaSize::USIZE,
             )
         }
     }
@@ -535,24 +545,24 @@ mod helpers {
 
 // This stuff must match edl file
 extern "C" {
-    fn allocate_oram_storage(count: u64, data_size: u64, meta_size: u64, id: *mut u64);
+    fn allocate_oram_storage(level: u32, count: u64, data_size: u64, meta_size: u64, id: *mut u64);
     fn release_oram_storage(id: u64);
     fn checkout_oram_storage(
         id: u64,
         idx: *const u64,
         idx_len: usize,
-        databuf: *mut u64,
+        databuf: *mut u8,
         databuf_size: usize,
-        metabuf: *mut u64,
+        metabuf: *mut u8,
         metabuf_size: usize,
     );
     fn checkin_oram_storage(
         id: u64,
         idx: *const u64,
         idx_len: usize,
-        databuf: *const u64,
+        databuf: *const u8,
         databuf_size: usize,
-        metabuf: *const u64,
+        metabuf: *const u8,
         metabuf_size: usize,
     );
 }

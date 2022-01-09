@@ -58,13 +58,15 @@ enclave {
         /// for untrusted to malloc the data part and not initialize it.
         ///
         /// Arguments:
+        /// - level: the current level of recursive ORAM
         /// - count: The number of data items (and metadata items)
         /// - data_size: The size in bytes of a data item. Must be a multiple of 8
         /// - meta_size: The size in bytes of a metadata item. Must be a multiple of 8
         /// - id: Output parameter for the id of the new allocation.
         ///
         /// Thread safety: This call is thread-safe unconditionally
-        void allocate_oram_storage(uint64_t count,
+        void allocate_oram_storage(uint32_t level,
+                                   uint64_t count,
                                    uint64_t data_size,
                                    uint64_t meta_size,
                                    [out] uint64_t * id);
@@ -86,11 +88,11 @@ enclave {
         ///        Each MUST be less than Count for this allocation.
         /// - idx_len: The number of storage indices to checkout.
         /// - databuf: Memory in which to place consecutive data items.
-        /// - databuf_size: Number of u64 elements in the databuf buffer.
-        ///                 MUST be equal to idx_len * DataSize / 8 for this allocation.
+        /// - databuf_size: Number of u8 elements in the databuf buffer.
+        ///                 MUST be equal to idx_len * DataSize for this allocation.
         /// - metabuf: Memory in which to place consecutive metadata items.
-        /// - metabuf_len: Number of u64 elements in the metabuf buffer.
-        ///                 MUST be equal to idx_len * MetaSize / 8 for this allocation.
+        /// - metabuf_len: Number of u8 elements in the metabuf buffer.
+        ///                 MUST be equal to idx_len * MetaSize for this allocation.
         ///
         /// Thread safety:
         /// The untrusted implementation may also assume that multiple threads will not
@@ -99,9 +101,9 @@ enclave {
         void checkout_oram_storage(uint64_t id,
                                    [in, count=idx_len] const uint64_t * idx,
                                    size_t idx_len,
-                                   [out, count=databuf_len] uint64_t * databuf,
+                                   [out, count=databuf_len] uint8_t * databuf,
                                    size_t databuf_len,
-                                   [out, count=metabuf_len] uint64_t * metabuf,
+                                   [out, count=metabuf_len] uint8_t * metabuf,
                                    size_t metabuf_len);
 
         /// Checkin several values to the untrusted storage allocation.
@@ -113,11 +115,11 @@ enclave {
         ///        Each MUST be less than Count for this allocation.
         /// - idx_len: The number of storage indices to checkout.
         /// - databuf: Memory in which to place consecutive data items.
-        /// - databuf_size: Number of u64 elements in the databuf buffer.
-        ///                 MUST be equal to idx_len * DataSize / 8 for this allocation.
+        /// - databuf_size: Number of u8 elements in the databuf buffer.
+        ///                 MUST be equal to idx_len * DataSize for this allocation.
         /// - metabuf: Memory in which to place consecutive metadata items.
-        /// - metabuf_len: Number of u64 elements in the metabuf buffer.
-        ///                 MUST be equal to idx_len * MetaSize / 8 for this allocation.
+        /// - metabuf_len: Number of u8 elements in the metabuf buffer.
+        ///                 MUST be equal to idx_len * MetaSize for this allocation.
         /// Thread safety:
         /// The untrusted implementation may also assume that multiple threads will not
         /// attempt to manipulate *the same storage id* concurrently, and may panic
@@ -125,9 +127,9 @@ enclave {
         void checkin_oram_storage(uint64_t id,
                                   [in, count=idx_len] const uint64_t * idx,
                                   size_t idx_len,
-                                  [in, count=databuf_len] const uint64_t * databuf,
+                                  [in, count=databuf_len] const uint8_t * databuf,
                                   size_t databuf_len,
-                                  [in, count=metabuf_len] const uint64_t * metabuf,
+                                  [in, count=metabuf_len] const uint8_t * metabuf,
                                   size_t metabuf_len);  
     };
 

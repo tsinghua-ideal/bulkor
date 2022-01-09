@@ -32,7 +32,12 @@ extern crate lazy_static;
 
 use std::slice;
 use std::string::{String, ToString};
-use std::sync::{atomic::Ordering, Arc, SgxMutex as Mutex, SgxRwLock as RwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering}, 
+    Arc, 
+    SgxMutex as Mutex, 
+    SgxRwLock as RwLock,
+};
 use std::thread;
 use std::time::Instant;
 use std::untrusted::time::InstantEx;
@@ -94,6 +99,8 @@ type ORAMClass = PathORAM<
 lazy_static! {
     /// Initialize ORAM if not yet
     static ref ORAM_OBJ: Mutex<Option<ORAMClass>> = Mutex::new(None);
+    /// Counter
+    static ref COUNTER: AtomicU64 = AtomicU64::new(0u64);
 }
 
 /// Create new oram if not exists
@@ -131,11 +138,16 @@ pub extern "C" fn ecall_access(
 ) -> sgx_status_t {
     let bytes = unsafe { slice::from_raw_parts_mut(query, query_len) };
     let resp_slice = unsafe { slice::from_raw_parts_mut(resp, resp_len) };
+    let query = Query::<StorageBlockSize>::decrypt_from(bytes);
+
+    let cur_counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let buf = query.encrypt_with_counter(cur_counter);
     let Query {
         op_type,
         idx,
         new_val,
-    } = Query::<StorageBlockSize>::decrypt_from(bytes);
+    } = query;
+
     let mut lk = ORAM_OBJ.lock().unwrap();
     let cur_oram = lk.as_mut().unwrap();
     let mut data = cur_oram.access(idx, |val, counter| {
