@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License..
 
-use sgx_trts::libc::{iovec, c_void};
-use core::marker::PhantomData;
-use alloc_crate::slice;
+use crate::marker::PhantomData;
+use crate::slice;
+
+use sgx_libc::{c_void, iovec};
 
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -37,9 +38,7 @@ impl<'a> IoSlice<'a> {
 
     #[inline]
     pub fn advance(&mut self, n: usize) {
-        if self.vec.iov_len < n {
-            panic!("advancing IoSlice beyond its length");
-        }
+        assert!(self.vec.iov_len >= n, "advancing IoSlice beyond its length");
 
         unsafe {
             self.vec.iov_len -= n;
@@ -70,9 +69,7 @@ impl<'a> IoSliceMut<'a> {
 
     #[inline]
     pub fn advance(&mut self, n: usize) {
-        if self.vec.iov_len < n {
-            panic!("advancing IoSliceMut beyond its length");
-        }
+        assert!(self.vec.iov_len >= n, "advancing IoSliceMut beyond its length");
 
         unsafe {
             self.vec.iov_len -= n;

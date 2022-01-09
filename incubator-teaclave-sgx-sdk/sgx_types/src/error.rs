@@ -35,6 +35,7 @@ impl_enum! {
         SGX_ERROR_INVALID_STATE             = 0x0000_0005,      /* SGX API is invoked in incorrect order or state */
         SGX_ERROR_FEATURE_NOT_SUPPORTED     = 0x0000_0008,      /* Feature is not supported on this platform */
         SGX_PTHREAD_EXIT                    = 0x0000_0009,      /* Enclave is exited with pthread_exit() */
+        SGX_ERROR_MEMORY_MAP_FAILURE        = 0x0000_000A,      /* Failed to reserve memory for the enclave */
 
         SGX_ERROR_INVALID_FUNCTION          = 0x0000_1001,      /* The ecall/ocall index is invalid */
         SGX_ERROR_OUT_OF_TCS                = 0x0000_1003,      /* The enclave is out of TCS */
@@ -52,10 +53,10 @@ impl_enum! {
         SGX_ERROR_NO_DEVICE                 = 0x0000_2006,      /* Can't open SGX device */
         SGX_ERROR_MEMORY_MAP_CONFLICT       = 0x0000_2007,      /* Page mapping failed in driver */
         SGX_ERROR_INVALID_METADATA          = 0x0000_2009,      /* The metadata is incorrect. */
-        SGX_ERROR_DEVICE_BUSY               = 0x0000_200c,      /* Device is busy, mostly EINIT failed. */
-        SGX_ERROR_INVALID_VERSION           = 0x0000_200d,      /* Metadata version is inconsistent between uRTS and sgx_sign or uRTS is incompatible with current platform. */
-        SGX_ERROR_MODE_INCOMPATIBLE         = 0x0000_200e,      /* The target enclave 32/64 bit mode or sim/hw mode is incompatible with the mode of current uRTS. */
-        SGX_ERROR_ENCLAVE_FILE_ACCESS       = 0x0000_200f,      /* Can't open enclave file. */
+        SGX_ERROR_DEVICE_BUSY               = 0x0000_200C,      /* Device is busy, mostly EINIT failed. */
+        SGX_ERROR_INVALID_VERSION           = 0x0000_200D,      /* Metadata version is inconsistent between uRTS and sgx_sign or uRTS is incompatible with current platform. */
+        SGX_ERROR_MODE_INCOMPATIBLE         = 0x0000_200E,      /* The target enclave 32/64 bit mode or sim/hw mode is incompatible with the mode of current uRTS. */
+        SGX_ERROR_ENCLAVE_FILE_ACCESS       = 0x0000_200F,      /* Can't open enclave file. */
         SGX_ERROR_INVALID_MISC              = 0x0000_2010,      /* The MiscSelct/MiscMask settings are not correct.*/
         SGX_ERROR_INVALID_LAUNCH_TOKEN      = 0x0000_2011,      /* The launch token is not correct.*/
 
@@ -73,11 +74,11 @@ impl_enum! {
         SGX_ERROR_UPDATE_NEEDED             = 0x0000_4006,   /* SGX needs to be updated */
         SGX_ERROR_NETWORK_FAILURE           = 0x0000_4007,   /* Network connecting or proxy setting issue is encountered */
         SGX_ERROR_AE_SESSION_INVALID        = 0x0000_4008,   /* Session is invalid or ended by server */
-        SGX_ERROR_BUSY                      = 0x0000_400a,   /* The requested service is temporarily not availabe */
-        SGX_ERROR_MC_NOT_FOUND              = 0x0000_400c,   /* The Monotonic Counter doesn't exist or has been invalided */
-        SGX_ERROR_MC_NO_ACCESS_RIGHT        = 0x0000_400d,   /* Caller doesn't have the access right to specified VMC */
-        SGX_ERROR_MC_USED_UP                = 0x0000_400e,   /* Monotonic counters are used out */
-        SGX_ERROR_MC_OVER_QUOTA             = 0x0000_400f,   /* Monotonic counters exceeds quota limitation */
+        SGX_ERROR_BUSY                      = 0x0000_400A,   /* The requested service is temporarily not availabe */
+        SGX_ERROR_MC_NOT_FOUND              = 0x0000_400C,   /* The Monotonic Counter doesn't exist or has been invalided */
+        SGX_ERROR_MC_NO_ACCESS_RIGHT        = 0x0000_400D,   /* Caller doesn't have the access right to specified VMC */
+        SGX_ERROR_MC_USED_UP                = 0x0000_400E,   /* Monotonic counters are used out */
+        SGX_ERROR_MC_OVER_QUOTA             = 0x0000_400F,   /* Monotonic counters exceeds quota limitation */
         SGX_ERROR_KDF_MISMATCH              = 0x0000_4011,   /* Key derivation function doesn't match during key exchange */
         SGX_ERROR_UNRECOGNIZED_PLATFORM     = 0x0000_4012,   /* EPID Provisioning failed due to platform not recognized by backend server*/
         SGX_ERROR_UNSUPPORTED_CONFIG        = 0x0000_4013,   /* The config for trigging EPID Provisiong or PSE Provisiong&LTP is invalid*/
@@ -131,6 +132,7 @@ impl sgx_status_t {
             sgx_status_t::SGX_ERROR_INVALID_STATE => "SGX API is invoked in incorrect order or state.",
             sgx_status_t::SGX_ERROR_FEATURE_NOT_SUPPORTED => "Feature is not supported on this platform.",
             sgx_status_t::SGX_PTHREAD_EXIT => "Enclave is exited with pthread_exit.",
+            sgx_status_t::SGX_ERROR_MEMORY_MAP_FAILURE => "Failed to reserve memory for the enclave.",
 
             sgx_status_t::SGX_ERROR_INVALID_FUNCTION => "The ecall/ocall index is invalid.",
             sgx_status_t::SGX_ERROR_OUT_OF_TCS => "The enclave is out of TCS.",
@@ -223,6 +225,7 @@ impl sgx_status_t {
             sgx_status_t::SGX_ERROR_INVALID_STATE => "SGX_ERROR_INVALID_STATE",
             sgx_status_t::SGX_ERROR_FEATURE_NOT_SUPPORTED => "SGX_ERROR_FEATURE_NOT_SUPPORTED",
             sgx_status_t::SGX_PTHREAD_EXIT => "SGX_PTHREAD_EXIT",
+            sgx_status_t::SGX_ERROR_MEMORY_MAP_FAILURE => "SGX_ERROR_MEMORY_MAP_FAILURE",
 
             sgx_status_t::SGX_ERROR_INVALID_FUNCTION => "SGX_ERROR_INVALID_FUNCTION",
             sgx_status_t::SGX_ERROR_OUT_OF_TCS => "SGX_ERROR_OUT_OF_TCS",
@@ -446,6 +449,7 @@ impl_enum! {
         SGX_QL_QVEIDENTITY_MISMATCH                         = 0x0000_E050,
         SGX_QL_QVE_OUT_OF_DATE                              = 0x0000_E051,
         SGX_QL_PSW_NOT_AVAILABLE                            = 0x0000_E052,
+        SGX_QL_COLLATERAL_VERSION_NOT_SUPPORTED             = 0x0000_E053,
         SGX_QL_ERROR_MAX                                    = 0x0000_E0FF,
     }
 }
@@ -530,6 +534,7 @@ impl sgx_quote3_error_t {
             sgx_quote3_error_t::SGX_QL_QVEIDENTITY_MISMATCH => "QvE Identity is NOT match to Intel signed QvE identity.",
             sgx_quote3_error_t::SGX_QL_QVE_OUT_OF_DATE => "QvE ISVSVN is smaller then the ISVSVN threshold.",
             sgx_quote3_error_t::SGX_QL_PSW_NOT_AVAILABLE => "SGX PSW library cannot be loaded, could be due to file I/O error.",
+            sgx_quote3_error_t::SGX_QL_COLLATERAL_VERSION_NOT_SUPPORTED => "SGX quote verification collateral version not supported by QVL/QvE",
             sgx_quote3_error_t::SGX_QL_ERROR_MAX => "Indicate max error to allow better translation.",
         }
     }
@@ -613,6 +618,7 @@ impl sgx_quote3_error_t {
             sgx_quote3_error_t::SGX_QL_QVEIDENTITY_MISMATCH => "SGX_QL_QVEIDENTITY_MISMATCH",
             sgx_quote3_error_t::SGX_QL_QVE_OUT_OF_DATE => "SGX_QL_QVE_OUT_OF_DATE",
             sgx_quote3_error_t::SGX_QL_PSW_NOT_AVAILABLE => "SGX_QL_PSW_NOT_AVAILABLE",
+            sgx_quote3_error_t::SGX_QL_COLLATERAL_VERSION_NOT_SUPPORTED => "SGX_QL_COLLATERAL_VERSION_NOT_SUPPORTED",
             sgx_quote3_error_t::SGX_QL_ERROR_MAX => "SGX_QL_ERROR_MAX",
         }
     }
@@ -647,6 +653,8 @@ impl_enum! {
         SGX_QCNL_ERROR_STATUS_PLATFORM_UNKNOWN  = 0x0000_B010,
         SGX_QCNL_ERROR_STATUS_UNEXPECTED        = 0x0000_B011,
         SGX_QCNL_ERROR_STATUS_CERTS_UNAVAILABLE = 0x0000_B012,
+        SGX_QCNL_ERROR_STATUS_SERVICE_UNAVAILABLE = 0x0000_B013,
+        SGX_QCNL_INVALID_CONFIG                 = 0x0000_B030,
     }
 }
 
@@ -672,6 +680,8 @@ impl sgx_qcnl_error_t {
             sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_PLATFORM_UNKNOWN => "Platform unknown.",
             sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_UNEXPECTED => "Unexpected cache error",
             sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_CERTS_UNAVAILABLE => "Certs not available",
+            sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_SERVICE_UNAVAILABLE => "Service is currently not available",
+            sgx_qcnl_error_t::SGX_QCNL_INVALID_CONFIG => "Error in configuration file",
         }
     }
 
@@ -696,6 +706,8 @@ impl sgx_qcnl_error_t {
             sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_PLATFORM_UNKNOWN => "SGX_QCNL_ERROR_STATUS_PLATFORM_UNKNOWN",
             sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_UNEXPECTED => "SGX_QCNL_ERROR_STATUS_UNEXPECTED",
             sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_CERTS_UNAVAILABLE => "SGX_QCNL_ERROR_STATUS_CERTS_UNAVAILABLE",
+            sgx_qcnl_error_t::SGX_QCNL_ERROR_STATUS_SERVICE_UNAVAILABLE => "SGX_QCNL_ERROR_STATUS_SERVICE_UNAVAILABLE",
+            sgx_qcnl_error_t::SGX_QCNL_INVALID_CONFIG => "SGX_QCNL_INVALID_CONFIG",
         }
     }
 }

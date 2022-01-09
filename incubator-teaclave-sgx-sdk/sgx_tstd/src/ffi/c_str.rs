@@ -21,6 +21,7 @@ use crate::error::Error;
 use crate::io;
 
 impl Error for NulError {
+    #[allow(deprecated)]
     fn description(&self) -> &str {
         "nul byte found in data"
     }
@@ -28,21 +29,22 @@ impl Error for NulError {
 
 impl From<NulError> for io::Error {
     /// Converts a [`NulError`] into a [`io::Error`].
-    ///
-    /// [`NulError`]: ../ffi/struct.NulError.html
-    /// [`io::Error`]: ../io/struct.Error.html
     fn from(_: NulError) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidInput, "data provided contains a nul byte")
+        io::Error::new_const(io::ErrorKind::InvalidInput, &"data provided contains a nul byte")
     }
 }
 
 impl Error for FromBytesWithNulError {
+    #[allow(deprecated)]
     fn description(&self) -> &str {
         self.__description()
     }
 }
 
+impl Error for FromVecWithNulError {}
+
 impl Error for IntoStringError {
+    #[allow(deprecated)]
     fn description(&self) -> &str {
         self.__description()
     }
