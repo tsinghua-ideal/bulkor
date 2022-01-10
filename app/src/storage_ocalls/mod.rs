@@ -39,10 +39,10 @@ use std::{
     alloc::{alloc, alloc_zeroed, dealloc, Layout},
     boxed::Box,
     cmp::max,
-    fs::{remove_file, File, OpenOptions},
-    io::{self, BufWriter, Read, Write},
+    fs::{File, OpenOptions},
+    io::Write,
     os::unix::fs::FileExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 

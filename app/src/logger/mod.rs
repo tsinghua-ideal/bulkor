@@ -1,10 +1,13 @@
-use std::fs;
+use std::fmt::format;
+use std::fs::{remove_file, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use log::error;
 use once_cell::sync::OnceCell;
 use simplelog::*;
 
+/// Output information, not for functional logging (e.g., logging queries).
 static LOGGER: OnceCell<()> = OnceCell::new();
 
 pub(crate) fn initialize_loggers<P: Into<PathBuf>>(file_path: P, level: LogLevel) {
@@ -14,7 +17,7 @@ pub(crate) fn initialize_loggers<P: Into<PathBuf>>(file_path: P, level: LogLevel
         let file_logger: Box<dyn SharedLogger> = WriteLogger::new(
             log_level,
             Config::default(),
-            fs::File::create(file_path).expect("not able to create log file"),
+            File::create(file_path).expect("not able to create log file"),
         );
         let mut combined = vec![file_logger];
         if let Some(term_logger) =
@@ -58,4 +61,21 @@ impl Into<LevelFilter> for LogLevel {
             _ => LevelFilter::Info,
         }
     }
+}
+
+
+/// This is for logging queries.
+#[no_mangle]
+pub extern "C" fn log_query(
+    id: u64,
+    query: *const u8,
+    query_len: usize,
+) {
+    let query = unsafe {
+        core::slice::from_raw_parts(query, query_len)
+    };
+    let path_str = format!("log_{:?}", id);
+    //think about hold the log somewhere, avoid opening it every time
+    let mut log = OpenOptions::new().create(true).append(true).read(true).open(&path_str).unwrap();
+    log.write_all(query).unwrap();
 }

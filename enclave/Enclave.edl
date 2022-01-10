@@ -21,7 +21,9 @@ enclave {
     from "sgx_backtrace.edl" import *;
     from "sgx_tstdc.edl" import *;
     from "sgx_pthread.edl" import *;
-    
+    from "sgx_sys.edl" import *;
+    from "sgx_thread.edl" import *;
+
     trusted {
         /* define ECALLs here. */
         public uint64_t ecall_create_oram(uint64_t n);
@@ -131,6 +133,16 @@ enclave {
                                   size_t databuf_len,
                                   [in, count=metabuf_len] const uint8_t * metabuf,
                                   size_t metabuf_len);  
+
+        /// Log the query before executing it
+        ///
+        /// Arguments:
+        /// - id: The id of the log to be written
+        /// - query: Memory in which to place query.
+        /// - query_len: Number of u8 elements in the query buffer.
+        void log_query(uint64_t id,
+                       [in, count=query_len] const uint8_t * query,
+                       size_t query_len);  
     };
 
 };

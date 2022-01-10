@@ -123,7 +123,11 @@ pub trait ORAM<ValueSize: ArrayLength<u8>> {
     ///
     /// This is the lowest-level API that we offer for getting data from the
     /// ORAM.
-    fn access<T, F: FnOnce(&mut A64Bytes<ValueSize>, &mut u64) -> T>(&mut self, index: u64, func: F) -> T;
+    fn access<T, F: FnOnce(&mut A64Bytes<ValueSize>, &mut u64) -> T>(
+        &mut self,
+        index: u64,
+        func: F,
+    ) -> T;
 
     /// High-level helper -- when you only need to read and don't need to write
     /// a new value, this is simpler than using `access`.
