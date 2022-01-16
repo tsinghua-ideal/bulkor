@@ -205,7 +205,8 @@ fn get_sender() -> Sender<Message> {
 
 fn do_backend(rx: Receiver<Message>) {
     let mut res;
-    let mut cur_log_id = 1;
+    // current saved snapshot
+    let mut snapshot_id = 1;
 
     while {
         res = rx.recv();
@@ -215,7 +216,7 @@ fn do_backend(rx: Receiver<Message>) {
             Message::Sync => (),
             Message::PosMap(pos_map) => {}
             Message::Query(query) => {
-                unsafe { log_query(cur_log_id, query.as_ptr(), query.len()) };
+                unsafe { log_query(snapshot_id, query.as_ptr(), query.len()) };
                 ()
             }
             Message::Stash(stash) => {}

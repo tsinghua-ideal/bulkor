@@ -108,18 +108,16 @@ fn main() {
         }
     }
 
-    let mut rng = RngType::from_seed([7u8; 32]);
-    exercise_oram(10000, &mut rng, n, enclave.geteid());
+    //exercise_oram(10000, n, enclave.geteid());
+    sanity_check(enclave.geteid());
 
     enclave.destroy();
 }
 
 /// Exercise an ORAM by writing, reading, and rewriting, a progressively larger
 /// set of random locations
-pub fn exercise_oram<R>(num_rounds: usize, rng: &mut R, len: u64, eid: sgx_enclave_id_t)
-where
-    R: RngCore + CryptoRng,
-{
+pub fn exercise_oram(num_rounds: usize, len: u64, eid: sgx_enclave_id_t) {
+    let mut rng = RngType::from_seed([7u8; 32]);
     let mut cur_num_rounds = num_rounds;
     assert!(len != 0, "len is zero");
     assert_eq!(len & (len - 1), 0, "len is not a power of two");
@@ -137,36 +135,7 @@ where
         let mut expected_ent = expected.entry(idx).or_default();
         rng.fill_bytes(expected_ent);
 
-        let mut query = Query::<StorageBlockSize> {
-            op_type: 1,
-            idx,
-            new_val: expected_ent.clone(),
-        }
-        .encrypt_to();
-        let query_len = query.len();
-        let resp_len = StorageBlockSize::USIZE + NonceSize::USIZE;
-        let mut resp = vec![0u8; resp_len];
-
-        let mut retval = sgx_status_t::SGX_SUCCESS;
-        let result = unsafe {
-            ecall_access(
-                eid,
-                &mut retval,
-                query.as_mut_ptr(),
-                query_len,
-                resp.as_mut_ptr(),
-                resp_len,
-            )
-        };
-        match result {
-            sgx_status_t::SGX_SUCCESS => {}
-            _ => {
-                println!("[-] ECALL Enclave Failed {}!", result.as_str());
-                return;
-            }
-        }
-        //println!("result = {:?}", query::decrypt_res(&mut resp));
-
+        let _res = access_wrapper(idx, expected_ent.clone(), eid);
         probe_idx += 1;
         cur_num_rounds -= 1;
     }
@@ -174,4 +143,48 @@ where
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     let per_dur = dur / (num_rounds as f64);
     println!("total time = {:?}s, time per query = {:?}s", dur, per_dur);
+}
+
+pub fn sanity_check(eid: sgx_enclave_id_t) {
+    assert_eq!(a64_bytes::<StorageBlockSize>(0).as_slice(), &access_wrapper(0, a64_bytes(1), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(1).as_slice(), &access_wrapper(0, a64_bytes(2), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(2).as_slice(), &access_wrapper(0, a64_bytes(3), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(0).as_slice(), &access_wrapper(2, a64_bytes(4), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(4).as_slice(), &access_wrapper(2, a64_bytes(5), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(3).as_slice(), &access_wrapper(0, a64_bytes(6), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(6).as_slice(), &access_wrapper(0, a64_bytes(7), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(0).as_slice(), &access_wrapper(9, a64_bytes(8), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(5).as_slice(), &access_wrapper(2, a64_bytes(10), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(7).as_slice(), &access_wrapper(0, a64_bytes(11), eid)[..]);
+    assert_eq!(a64_bytes::<StorageBlockSize>(8).as_slice(), &access_wrapper(9, a64_bytes(12), eid)[..]);
+}
+
+pub fn access_wrapper(idx: u64, data: A64Bytes<StorageBlockSize>, eid: sgx_enclave_id_t) -> Vec<u8> {
+    let mut query = Query::<StorageBlockSize> {
+        op_type: 1,
+        idx,
+        new_val: data.clone(),
+    }.encrypt_to();
+    let query_len = query.len();
+    let resp_len = StorageBlockSize::USIZE + NonceSize::USIZE;
+    let mut resp = vec![0u8; resp_len];
+    let mut retval = sgx_status_t::SGX_SUCCESS;
+    let result = unsafe {
+        ecall_access(
+            eid,
+            &mut retval,
+            query.as_mut_ptr(),
+            query_len,
+            resp.as_mut_ptr(),
+            resp_len,
+        )
+    };
+    match result {
+        sgx_status_t::SGX_SUCCESS => {}
+        _ => {
+            println!("[-] ECALL Enclave Failed {}!", result.as_str());
+            return Vec::new();
+        }
+    }
+    query::decrypt_res(&mut resp).to_vec()
 }
