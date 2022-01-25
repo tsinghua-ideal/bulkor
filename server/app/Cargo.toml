@@ -1,0 +1,70 @@
+[package]
+name = "app"
+version = "1.0.0"
+authors = ["Xiang Li <Xiang.Leee@outlook.com>"]
+license = "GPL-3.0"
+edition = "2018"
+build = "build.rs"
+
+
+[target.'cfg(any(target_feature = "avx2", target_feature = "avx"))'.dependencies]
+blake2 = { version = "0.9.2", default-features = false, features = ["simd"] }
+
+[target.'cfg(not(any(target_feature = "avx2", target_feature = "avx")))'.dependencies]
+blake2 = { version = "0.9.2", default-features = false }
+
+[dependencies]
+sgx_types = { git = "https://github.com/apache/teaclave-sgx-sdk.git", branch = "master"  }
+sgx_urts = { git = "https://github.com/apache/teaclave-sgx-sdk.git", branch = "master"  }
+sgx_tprotected_fs = { git = "https://github.com/apache/teaclave-sgx-sdk.git", branch = "master" }
+
+aes = { version = "0.7.5", default-features = false, features = ["ctr"] }
+aligned-cmov = "2.0.0"
+flume = "0.10"
+lazy_static = "1.4"
+libc = "0.2"
+log = "0.4.8"
+once_cell = "1.3.1"
+rand_core = { version = "0.6", default-features = false }
+rand_hc = "0.3"
+regex = "1"
+simplelog = "0.7.5"
+tokio = { version = "1", features = ["full"] }
+
+# serialization
+bincode = "1.2.1"
+
+
+# randomness
+rand = "0.7"
+rand_distr = "0.2"
+rand_pcg = "0.2"
+
+[patch.'https://github.com/apache/teaclave-sgx-sdk.git']
+sgx_alloc = { path = "../../incubator-teaclave-sgx-sdk/sgx_alloc" }
+sgx_backtrace = { path = "../../incubator-teaclave-sgx-sdk/sgx_backtrace" }
+sgx_backtrace_sys = { path = "../../incubator-teaclave-sgx-sdk/sgx_backtrace_sys" }
+sgx_build_helper = { path = "../../incubator-teaclave-sgx-sdk/sgx_build_helper" }
+sgx_cov = { path = "../../incubator-teaclave-sgx-sdk/sgx_cov" }
+sgx_crypto_helper = { path = "../../incubator-teaclave-sgx-sdk/sgx_crypto_helper" }
+sgx_demangle = { path = "../../incubator-teaclave-sgx-sdk/sgx_demangle" }
+sgx_libc = { path = "../../incubator-teaclave-sgx-sdk/sgx_libc" }
+sgx_rand = { path = "../../incubator-teaclave-sgx-sdk/sgx_rand" }
+sgx_rand_derive = { path = "../../incubator-teaclave-sgx-sdk/sgx_rand_derive" }
+sgx_serialize = { path = "../../incubator-teaclave-sgx-sdk/sgx_serialize" }
+sgx_serialize_derive = { path = "../../incubator-teaclave-sgx-sdk/sgx_serialize_derive" }
+sgx_serialize_derive_internals = { path = "../../incubator-teaclave-sgx-sdk/sgx_serialize_derive_internals" }
+sgx_tcrypto = { path = "../../incubator-teaclave-sgx-sdk/sgx_tcrypto" }
+sgx_tcrypto_helper = { path = "../../incubator-teaclave-sgx-sdk/sgx_tcrypto_helper" }
+sgx_tdh = { path = "../../incubator-teaclave-sgx-sdk/sgx_tdh" }
+sgx_tkey_exchange = { path = "../../incubator-teaclave-sgx-sdk/sgx_tkey_exchange" }
+sgx_tprotected_fs = { path = "../../incubator-teaclave-sgx-sdk/sgx_tprotected_fs" }
+sgx_trts = { path = "../../incubator-teaclave-sgx-sdk/sgx_trts" }
+sgx_tse = { path = "../../incubator-teaclave-sgx-sdk/sgx_tse" }
+sgx_tseal = { path = "../../incubator-teaclave-sgx-sdk/sgx_tseal" }
+sgx_tstd = { path = "../../incubator-teaclave-sgx-sdk/sgx_tstd" }
+sgx_tunittest = { path = "../../incubator-teaclave-sgx-sdk/sgx_tunittest" }
+sgx_types = { path = "../../incubator-teaclave-sgx-sdk/sgx_types" }
+sgx_ucrypto = { path = "../../incubator-teaclave-sgx-sdk/sgx_ucrypto" }
+sgx_unwind = { path = "../../incubator-teaclave-sgx-sdk/sgx_unwind" }
+sgx_urts = { path = "../../incubator-teaclave-sgx-sdk/sgx_urts" }
