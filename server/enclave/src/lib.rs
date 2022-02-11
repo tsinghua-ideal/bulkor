@@ -158,6 +158,7 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
         get_valid_snapshot_id(size_triv_pos_map, &mut snapshot_id);
     }
     SNAPSHOT_ID.store(snapshot_id, Ordering::SeqCst);
+    println!("get_valid_snapshot_id = {:?}", snapshot_id);
     let rng = get_seeded_rng();
     let mut new_oram = ORAMCreatorClass::create(n, STASH_SIZE, &mut rng_maker(rng));
 
@@ -167,14 +168,20 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
         .unwrap()
         .remove(&snapshot_id)
         .unwrap_or(0);
+    println!("log_len = {:?}, log_pos = {:?}", log_len, log_pos);
     let queries_buf_cap = (log_len - log_pos) as usize;
     println!("queries_buf_cap = {:?}", queries_buf_cap);
-    let mut queries_buf = Vec::with_capacity(queries_buf_cap);
+    let mut queries_buf = vec![0; queries_buf_cap];
     log.as_mut().map(|l| {
-        l.seek(SeekFrom::Start(log_pos - 8)).unwrap();
-        let mut snapshot_id_buf = [0; 8];
-        l.read_exact(&mut snapshot_id_buf).unwrap();
-        assert_eq!(snapshot_id, u64::from_le_bytes(snapshot_id_buf));
+        if snapshot_id != 0 {
+            l.seek(SeekFrom::Start(log_pos - 8)).unwrap();
+            let mut snapshot_id_buf = [0; 8];
+            l.read_exact(&mut snapshot_id_buf).unwrap();
+            assert_eq!(snapshot_id, u64::from_le_bytes(snapshot_id_buf));
+        } else {
+            l.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(log_pos, 0);
+        }
         l.read_exact(&mut queries_buf).unwrap();
     });
     assert_eq!(queries_buf_cap, queries_buf.len());
