@@ -548,9 +548,14 @@ where
         volatile: bool,
         rng: &mut Rng,
     ) {
-        if !volatile {
-            unsafe { persist_oram_storage(self.level, new_snapshot_id, self.allocation_id) };
-        }
+        unsafe {
+            persist_oram_storage(
+                self.level,
+                new_snapshot_id,
+                volatile as u8,
+                self.allocation_id,
+            )
+        };
         self.treetop.persist(new_snapshot_id, volatile, rng);
         //encrypt the merkle roots and send it out
         //TODO: This step can be in parallel with the following ones
@@ -670,7 +675,7 @@ extern "C" {
         meta_size: u64,
         id: *mut u64,
     );
-    fn persist_oram_storage(level: u32, snapshot_id: u64, id: u64);
+    fn persist_oram_storage(level: u32, snapshot_id: u64, is_volatile: u8, id: u64);
     fn checkout_oram_storage(
         id: u64,
         idx: *const u64,

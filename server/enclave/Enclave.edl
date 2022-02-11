@@ -81,6 +81,7 @@ enclave {
         /// Ask untrusted to persist oram storage
         void persist_oram_storage(uint32_t level,
                                 uint64_t snapshot_id,
+                                uint8_t is_volatile,
                                 uint64_t id);
 
         /// Checkout several values from the untrusted storage allocation.

@@ -388,6 +388,10 @@ pub fn sanity_check(eid: sgx_enclave_id_t) {
         a64_bytes::<StorageBlockSize>(8).as_slice(),
         &simple_access_wrapper(9, a64_bytes(12), eid, &mut rng)[..]
     );
+    assert_eq!(
+        a64_bytes::<StorageBlockSize>(12).as_slice(),
+        &simple_access_wrapper(9, a64_bytes(13), eid, &mut rng)[..]
+    );
 }
 
 pub fn simple_access_wrapper(
