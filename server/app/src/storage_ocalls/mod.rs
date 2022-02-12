@@ -438,8 +438,6 @@ pub unsafe extern "C" fn persist_oram_storage(
     let meta = core::slice::from_raw_parts((*ptr).meta_pointer, 2 * count_in_mem * meta_item_size);
     let ptrs_m = &mut (*ptr).ptrs;
 
-    //in mem snapshot switch
-    clear_all_in_mem_sts(ptrs_m, count_in_mem - 1);
     //on disk persistence
     if is_volatile == 0 {
         let old_snapshot_id = LAST_ON_DISK_SNAPSHOT_ID.load(Ordering::SeqCst);
@@ -485,7 +483,9 @@ pub unsafe extern "C" fn persist_oram_storage(
         }
 
         //on disk snapshot switch
-        clear_all_sts(&mut ptrs_d, usize::MAX);
+        clear_all_sts(&mut ptrs_d, count_in_mem - 1);
+        clear_all_sts(ptrs_m, usize::MAX);
+        (&mut ptrs_d[count_in_mem / 2..]).copy_from_slice(&ptrs_m[count_in_mem / 2..]);
 
         let new_ptr_file_name =
             PathBuf::from("ptr_".to_string() + &snapshot_id.to_string() + "-" + &level.to_string());
@@ -497,6 +497,9 @@ pub unsafe extern "C" fn persist_oram_storage(
             .unwrap();
 
         new_ptr_file.write_all(&ptrs_d).unwrap();
+    } else {
+        //in mem snapshot switch
+        clear_all_in_mem_sts(ptrs_m, count_in_mem - 1);
     }
 
     assert!(
