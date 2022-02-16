@@ -694,12 +694,12 @@ pub unsafe extern "C" fn checkin_oram_storage(
     // Second step: Do the part that's in the treetop
     for (count, index) in indices.iter().enumerate() {
         let index = *index as usize;
-        let (_, sts_in_mem, mut p) = get_sts_ptr(ptrs, index);
-        if !sts_in_mem {
-            p = p ^ 1;
-        }
-        set_ptr(ptrs, index, p);
         if count < first_treetop_index {
+            let (sts_on_disk, _, mut p) = get_sts_ptr(ptrs, index);
+            if !sts_on_disk {
+                p = p ^ 1;
+            }
+            set_ptr(ptrs, index, p);
             (*ptr)
                 .data_file
                 .write_all_at(
@@ -708,6 +708,11 @@ pub unsafe extern "C" fn checkin_oram_storage(
                 )
                 .unwrap();
         } else {
+            let (_, sts_in_mem, mut p) = get_sts_ptr(ptrs, index);
+            if !sts_in_mem {
+                p = p ^ 1;
+            }
+            set_ptr(ptrs, index, p);
             core::ptr::copy_nonoverlapping(
                 databuf.add(data_item_size * count),
                 (*ptr).data_pointer.add(data_item_size * (index * 2 + p)),
