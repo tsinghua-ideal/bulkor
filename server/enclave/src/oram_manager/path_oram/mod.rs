@@ -30,7 +30,7 @@ use rand_core::{CryptoRng, RngCore};
 
 use crate::oram_manager::{DataMetaSize, PosMetaSize};
 use crate::oram_storage::{
-    persist_stash, recover_stash, release_states, s_decrypt, s_encrypt, MAX_LEVEL, ORAM_KEY,
+    persist_stash, recover_stash, s_decrypt, s_encrypt, MAX_LEVEL, ORAM_KEY,
 };
 use crate::oram_traits::{
     log2_ceil, ORAMStorage, ORAMStorageCreator, PositionMap, PositionMapCreator, ORAM,
@@ -403,13 +403,6 @@ where
         self.storage
             .persist(new_snapshot_id, volatile, &mut self.rng);
         self.pos.persist(new_snapshot_id, volatile);
-
-        //TODO: release all old persisted metadata
-        // if self.level == 0 {
-        //     unsafe {
-        //         release_states(new_snapshot_id);
-        //     }
-        // }
     }
 }
 

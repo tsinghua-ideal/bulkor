@@ -899,7 +899,6 @@ pub extern "C" fn recover_stash(
             stash_meta.copy_from_slice(meta);
         }
         None => {
-            // TODO: the deletion of stale file
             let stash_data_file_name = PathBuf::from(
                 "stash_data_".to_string() + &snapshot_id.to_string() + "-" + &level.to_string(),
             );
@@ -979,7 +978,6 @@ pub extern "C" fn recover_treetop(
             meta.copy_from_slice(m);
         }
         None => {
-            // TODO: the deletion of stale file
             let data_file_name = PathBuf::from(
                 "treetop_data_".to_string() + &snapshot_id.to_string() + "-" + &level.to_string(),
             );
@@ -1046,7 +1044,6 @@ pub extern "C" fn recover_merkle_roots(
             roots.copy_from_slice(d);
         }
         None => {
-            // TODO: the deletion of stale file
             let data_file_name = PathBuf::from(
                 "merkle_roots_".to_string() + &snapshot_id.to_string() + "-" + &level.to_string(),
             );
@@ -1073,6 +1070,21 @@ pub extern "C" fn persist_trivial_posmap(
     let mut state_map = SNAPSHOT_TO_TPOSMAP.lock().unwrap();
     state_map.insert(new_snapshot_id, new_posmap.to_vec());
 
+    // Remove stale in-memory states
+    SNAPSHOT_TO_STASH
+        .lock()
+        .unwrap()
+        .retain(|&k, _| k == new_snapshot_id);
+    SNAPSHOT_TO_TREETOP
+        .lock()
+        .unwrap()
+        .retain(|&k, _| k == new_snapshot_id);
+    SNAPSHOT_TO_MROOTS
+        .lock()
+        .unwrap()
+        .retain(|&k, _| k == new_snapshot_id);
+    state_map.retain(|&k, _| k == new_snapshot_id);
+
     if is_volatile == 0 {
         let data_file_name =
             PathBuf::from("trivial_posmap_".to_string() + &new_snapshot_id.to_string());
@@ -1080,6 +1092,43 @@ pub extern "C" fn persist_trivial_posmap(
             f.write_all(new_posmap).unwrap();
         };
         LAST_ON_DISK_SNAPSHOT_ID.store(new_snapshot_id, Ordering::SeqCst);
+        // Delete stale files
+        // First step: read from disk
+        let path = Path::new("./");
+        let mut id_to_files = BTreeMap::new();
+        for entry in fs::read_dir(path).expect("reading directory fails") {
+            if let Ok(entry) = entry {
+                let file = entry.path();
+                let filename = file.to_str().unwrap();
+
+                if filename.contains("trivial_posmap_") {
+                    lazy_static! {
+                        static ref RE: Regex = Regex::new(r"trivial_posmap_(\d+)").unwrap();
+                    }
+                    for cap in RE.captures_iter(filename) {
+                        let id = (&cap[1]).parse::<u64>().unwrap();
+                        let files = id_to_files.entry(id).or_insert(vec![]);
+                        files.push(file.clone());
+                    }
+                } else {
+                    lazy_static! {
+                        static ref RE: Regex = Regex::new(r"(\d+)-(\d+)").unwrap();
+                    }
+                    for cap in RE.captures_iter(filename) {
+                        let id = (&cap[1]).parse::<u64>().unwrap();
+                        let files = id_to_files.entry(id).or_insert(vec![]);
+                        files.push(file.clone());
+                    }
+                }
+            }
+        }
+        // Second step: remove
+        id_to_files.remove(&new_snapshot_id);
+        for (_, files) in id_to_files.iter() {
+            for file in files {
+                remove_file(file).unwrap();
+            }
+        }
     }
     println!("end persist_trivial_posmap");
 }
@@ -1098,7 +1147,6 @@ pub extern "C" fn recover_trivial_posmap(posmap: *mut u8, posmap_len: usize, sna
             posmap.copy_from_slice(d);
         }
         None => {
-            // TODO: the deletion of stale file
             let data_file_name =
                 PathBuf::from("trivial_posmap_".to_string() + &snapshot_id.to_string());
             if let Ok(mut f) = File::open(&data_file_name) {
@@ -1107,11 +1155,6 @@ pub extern "C" fn recover_trivial_posmap(posmap: *mut u8, posmap_len: usize, sna
         }
     }
     println!("end recover_trivial_posmap");
-}
-
-#[no_mangle]
-pub extern "C" fn release_states(snapshot_id: u64) {
-    unimplemented!()
 }
 
 // This module is only used in debug builds, it allows us to ensure that an id

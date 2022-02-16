@@ -229,12 +229,6 @@ enclave {
                             size_t posmap_len,
                             uint64_t snapshot_id); 
         
-        /// Release the previously persisted states
-        /// 
-        /// Arguments:
-        /// - snapshot_id: release the in-memory persisted states before snapshot_id
-        void release_states(uint64_t snapshot_id);
-
     };
 
 };

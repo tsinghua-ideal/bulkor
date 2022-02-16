@@ -744,5 +744,4 @@ extern "C" {
         is_volatile: u8,
     );
     pub fn recover_trivial_posmap(posmap: *mut u8, posmap_len: usize, snapshot_id: u64);
-    pub fn release_states(snapshot_id: u64);
 }
