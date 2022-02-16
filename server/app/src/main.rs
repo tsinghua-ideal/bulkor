@@ -178,7 +178,9 @@ fn main() {
     let base_dir = std::env::current_dir().expect("not found path");
     logger::initialize_loggers(base_dir.join("running.log"), LogLevel::Info);
 
-    fn init_enclave_and_oram() -> (SgxEnclave, u64, Vec<Vec<u8>>) {
+    //let n = 8 << 20; //8M*1KB
+    let n = 8 << 10;
+    fn init_enclave_and_oram(n: u64) -> (SgxEnclave, u64, Vec<Vec<u8>>) {
         log::info!("Initializing enclave...");
         let enclave = match init_enclave() {
             Ok(r) => {
@@ -192,8 +194,6 @@ fn main() {
         log::info!("Enclave intialization finished.");
         let eid = enclave.geteid();
 
-        //let n = 8 << 20; //8M*1KB
-        let n = 8 << 10;
         let mut retval = n;
         let mut results_ptr = 0;
         let result_code = unsafe { ecall_create_oram(eid, &mut retval, n, &mut results_ptr) };
@@ -215,7 +215,7 @@ fn main() {
         (enclave, eid, results)
     }
 
-    let (mut enclave, mut eid, mut remaining_results) = init_enclave_and_oram();
+    let (mut enclave, mut eid, mut remaining_results) = init_enclave_and_oram(n);
     println!("remaining_results = {:?}", remaining_results);
 
     let (shutdown_tx, shutdown_rx) = flume::unbounded();
@@ -292,7 +292,7 @@ fn main() {
             break;
         } else if counter % limit_enclave_crash == 0 && counter != 0 {
             enclave.destroy();
-            let mut t = init_enclave_and_oram();
+            let mut t = init_enclave_and_oram(n);
             enclave = t.0;
             eid = t.1;
             remaining_results.append(&mut t.2);
