@@ -35,14 +35,12 @@
 
 #![deny(missing_docs)]
 
-use aligned_cmov::typenum::{Unsigned, U40};
 use regex::Regex;
 use std::{
     alloc::{alloc, alloc_zeroed, dealloc, Layout},
     boxed::Box,
     cmp::max,
     collections::BTreeMap,
-    convert::TryInto,
     fs::{self, remove_file, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::FileExt,
@@ -93,25 +91,13 @@ lazy_static! {
     pub static ref LAST_ON_DISK_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(0u64);
 }
 
-//consistent with enclave/src/oram_storage/extra_meta.rs
-pub type ExtraMetaSize = U40;
-
-fn extract_block_ctr(meta_item: &[u8]) -> u64 {
-    let l = meta_item.len();
-    u64::from_le_bytes(
-        meta_item[l - ExtraMetaSize::USIZE..l - ExtraMetaSize::USIZE + 8]
-            .try_into()
-            .unwrap(),
-    )
-}
-
 //return (does snapshot become old, the newest value is on the left/right)
 fn get_sts_ptr(ptrs: &Vec<u8>, idx: usize) -> (bool, bool, usize) {
     let ptr_arr = ptrs[idx / 2];
     let r = ptr_arr >> ((1 - idx % 2) << 2);
-    let on_disk_snapshot_become_old = (r >> 2) & 1 == 1;
-    let in_mem_snapshot_become_old = (r >> 1) & 1 == 1;
-    let pos_newest_value = (r & 1) as usize;
+    let on_disk_snapshot_become_old = (r >> 3) & 1 == 1;
+    let in_mem_snapshot_become_old = (r >> 2) & 1 == 1;
+    let pos_newest_value = (r & 0b11) as usize;
     (
         on_disk_snapshot_become_old,
         in_mem_snapshot_become_old,
@@ -123,14 +109,12 @@ fn get_sts_ptr(ptrs: &Vec<u8>, idx: usize) -> (bool, bool, usize) {
 // automatically set snapshot becomes old
 fn set_ptr(ptrs: &mut Vec<u8>, idx: usize, v: usize) {
     let mut ptr_arr = ptrs[idx / 2];
-    let ptr_mask = 1 << ((1 - idx % 2) << 2);
-    let sts_mask = (4 + 2) << ((1 - idx % 2) << 2);
+    let v = (v as u8) << ((1 - idx % 2) << 2);
+    let ptr_mask = 0b11 << ((1 - idx % 2) << 2);
+    let sts_mask = 0b1100 << ((1 - idx % 2) << 2);
     //set ptr
-    if v == 0 {
-        ptr_arr = ptr_arr & !ptr_mask;
-    } else {
-        ptr_arr = ptr_arr | ptr_mask;
-    }
+    ptr_arr = ptr_arr & !ptr_mask;
+    ptr_arr = ptr_arr | v;
     //set states
     ptr_arr = ptr_arr | sts_mask;
     ptrs[idx / 2] = ptr_arr;
@@ -141,32 +125,32 @@ fn clear_all_in_mem_sts(ptrs: &mut Vec<u8>, end_idx: usize) {
     let end = end_idx / 2;
     let mut ptr = ptrs[end];
     match end_idx % 2 {
-        0 => ptr = ptr & 0b11011111,
-        1 => ptr = ptr & 0b11011101,
+        0 => ptr = ptr & 0b10111111,
+        1 => ptr = ptr & 0b10111011,
         _ => unreachable!(),
     }
     ptrs[end] = ptr;
     for ptr in &mut ptrs[..end] {
-        *ptr = *ptr & 0b11011101;
+        *ptr = *ptr & 0b10111011;
     }
 }
 
 fn clear_all_sts(ptrs: &mut Vec<u8>, end_idx: usize) {
     if end_idx == usize::MAX {
         for ptr in ptrs {
-            *ptr = *ptr & 0b10011001;
+            *ptr = *ptr & 0b00110011;
         }
     } else {
         let end = end_idx / 2;
         let mut ptr = ptrs[end];
         match end_idx % 2 {
-            0 => ptr = ptr & 0b10011111,
-            1 => ptr = ptr & 0b10011001,
+            0 => ptr = ptr & 0b00111111,
+            1 => ptr = ptr & 0b00110011,
             _ => unreachable!(),
         }
         ptrs[end] = ptr;
         for ptr in &mut ptrs[..end] {
-            *ptr = *ptr & 0b10011001;
+            *ptr = *ptr & 0b00110011;
         }
     }
 }
@@ -310,11 +294,11 @@ impl UntrustedAllocation {
             let ptr_file_len = ptr_file.metadata().unwrap().len() as usize;
             // Initialization is not finished, so do the initialization
             let zeros = vec![0u8; data_item_size];
-            while data_file_len < 2 * count * data_item_size {
+            while data_file_len < (2 * count_in_mem + 3 * (count - count_in_mem)) * data_item_size {
                 data_file.write_all(&zeros).unwrap();
                 data_file_len += data_item_size;
             }
-            while meta_file_len < 2 * count * meta_item_size {
+            while meta_file_len < (2 * count_in_mem + 3 * (count - count_in_mem)) * meta_item_size {
                 meta_file.write_all(&zeros[..meta_item_size]).unwrap();
                 meta_file_len += meta_item_size;
             }
@@ -440,6 +424,8 @@ pub unsafe extern "C" fn persist_oram_storage(
 
     //on disk persistence
     if is_volatile == 0 {
+        clear_all_sts(ptrs_m, usize::MAX);
+        let ptrs_m = ptrs_m.clone(); //avoid blocking access
         let old_snapshot_id = LAST_ON_DISK_SNAPSHOT_ID.load(Ordering::SeqCst);
         let old_ptr_file_name = PathBuf::from(
             "ptr_".to_string() + &old_snapshot_id.to_string() + "-" + &level.to_string(),
@@ -454,8 +440,9 @@ pub unsafe extern "C" fn persist_oram_storage(
         old_ptr_file.read_to_end(&mut ptrs_d).unwrap(); //TODO: optimization
 
         for idx in 1..count_in_mem {
-            let (sts_on_disk, _, p_src) = get_sts_ptr(ptrs_m, idx);
+            let (sts_on_disk, _, p_src) = get_sts_ptr(&ptrs_m, idx);
             let (old_sts_on_disk, old_sts_in_mem, mut p_dst) = get_sts_ptr(&ptrs_d, idx);
+            assert!(p_src < 2 && p_dst < 2); //for in memory part, p cannot be larger than 1
             assert_eq!(old_sts_on_disk || old_sts_in_mem, false);
             if sts_on_disk {
                 // update exists
@@ -484,7 +471,6 @@ pub unsafe extern "C" fn persist_oram_storage(
 
         //on disk snapshot switch
         clear_all_sts(&mut ptrs_d, count_in_mem - 1);
-        clear_all_sts(ptrs_m, usize::MAX);
         (&mut ptrs_d[count_in_mem / 2..]).copy_from_slice(&ptrs_m[count_in_mem / 2..]);
 
         let new_ptr_file_name =
@@ -576,6 +562,7 @@ pub unsafe extern "C" fn checkout_oram_storage(
         "illegal checkout"
     );
 
+    let count_in_mem = (*ptr).count_in_mem;
     let data_item_size = (*ptr).data_item_size;
     let meta_item_size = (*ptr).meta_item_size;
     assert!(idx_len * data_item_size == databuf_len);
@@ -599,10 +586,11 @@ pub unsafe extern "C" fn checkout_oram_storage(
                 .data_file
                 .read_exact_at(
                     &mut databuf_s[data_item_size * count..data_item_size * (count + 1)],
-                    (data_item_size * (index * 2 + p)) as u64,
+                    (data_item_size * (count_in_mem * 2 + (index - count_in_mem) * 3 + p)) as u64,
                 )
                 .unwrap();
         } else {
+            assert!(p < 2);
             core::ptr::copy_nonoverlapping(
                 (*ptr).data_pointer.add(data_item_size * (index * 2 + p)),
                 databuf.add(data_item_size * count),
@@ -619,10 +607,11 @@ pub unsafe extern "C" fn checkout_oram_storage(
                 .meta_file
                 .read_exact_at(
                     &mut metabuf_s[meta_item_size * count..meta_item_size * (count + 1)],
-                    (meta_item_size * (index * 2 + p)) as u64,
+                    (meta_item_size * (count_in_mem * 2 + (index - count_in_mem) * 3 + p)) as u64,
                 )
                 .unwrap();
         } else {
+            assert!(p < 2);
             core::ptr::copy_nonoverlapping(
                 (*ptr).meta_pointer.add(meta_item_size * (index * 2 + p)),
                 metabuf.add(meta_item_size * count),
@@ -675,6 +664,7 @@ pub unsafe extern "C" fn checkin_oram_storage(
         "illegal checkin"
     );
 
+    let count_in_mem = (*ptr).count_in_mem;
     let data_item_size = (*ptr).data_item_size;
     let meta_item_size = (*ptr).meta_item_size;
     assert!(idx_len * data_item_size == databuf_len);
@@ -697,18 +687,19 @@ pub unsafe extern "C" fn checkin_oram_storage(
         if count < first_treetop_index {
             let (sts_on_disk, _, mut p) = get_sts_ptr(ptrs, index);
             if !sts_on_disk {
-                p = p ^ 1;
+                p = (p + 1) % 3;
             }
             set_ptr(ptrs, index, p);
             (*ptr)
                 .data_file
                 .write_all_at(
                     &databuf_s[data_item_size * count..data_item_size * (count + 1)],
-                    (data_item_size * (index * 2 + p)) as u64,
+                    (data_item_size * (count_in_mem * 2 + (index - count_in_mem) * 3 + p)) as u64,
                 )
                 .unwrap();
         } else {
             let (_, sts_in_mem, mut p) = get_sts_ptr(ptrs, index);
+            assert!(p < 2);
             if !sts_in_mem {
                 p = p ^ 1;
             }
@@ -730,7 +721,7 @@ pub unsafe extern "C" fn checkin_oram_storage(
                 .meta_file
                 .write_all_at(
                     &metabuf_s[meta_item_size * count..meta_item_size * (count + 1)],
-                    (meta_item_size * (index * 2 + p)) as u64,
+                    (meta_item_size * (count_in_mem * 2 + (index - count_in_mem) * 3 + p)) as u64,
                 )
                 .unwrap();
         } else {
