@@ -104,6 +104,43 @@ fn init_enclave() -> SgxResult<SgxEnclave> {
     )
 }
 
+fn init_enclave_and_oram() -> (SgxEnclave, u64, Vec<Vec<u8>>) {
+    log::info!("Initializing enclave...");
+    let enclave = match init_enclave() {
+        Ok(r) => {
+            println!("[+] Init Enclave Successful {}!", r.geteid());
+            r
+        }
+        Err(x) => {
+            panic!("[-] Init Enclave Failed {}!", x.as_str());
+        }
+    };
+    log::info!("Enclave intialization finished.");
+    let eid = enclave.geteid();
+
+    //let n = 8 << 20; //8M*1KB
+    let n = 8 << 10;
+    let mut retval = n;
+    let mut results_ptr = 0;
+    let result_code = unsafe { ecall_create_oram(eid, &mut retval, n, &mut results_ptr) };
+    match result_code {
+        sgx_status_t::SGX_SUCCESS => {}
+        _ => {
+            panic!("[-] ECALL Enclave Failed {}!", result_code.as_str());
+        }
+    }
+    let results_in_enclave = unsafe { Box::from_raw(results_ptr as *mut Vec<u8>) };
+    assert_eq!(results_in_enclave.len() % ANSWER_SIZE, 0);
+    let results = results_in_enclave
+        .chunks(ANSWER_SIZE)
+        .map(|x| x.to_vec())
+        .collect::<Vec<_>>();
+    std::mem::forget(results_in_enclave);
+    unsafe { ecall_release_results_space(eid, results_ptr) };
+
+    (enclave, eid, results)
+}
+
 async fn handle_client(req_tx: Sender<Message>, mut stream: TcpStream) {
     let mut id_buf: [u8; 8] = Default::default();
     stream.read_exact(&mut id_buf).await.unwrap();
@@ -174,48 +211,7 @@ async fn listen_to_clients(req_tx: Sender<Message>, shutdown_rx: Receiver<()>) {
     // drop(listener);
 }
 
-fn main() {
-    let base_dir = std::env::current_dir().expect("not found path");
-    logger::initialize_loggers(base_dir.join("running.log"), LogLevel::Info);
-
-    //let n = 8 << 20; //8M*1KB
-    let n = 8 << 10;
-    fn init_enclave_and_oram(n: u64) -> (SgxEnclave, u64, Vec<Vec<u8>>) {
-        log::info!("Initializing enclave...");
-        let enclave = match init_enclave() {
-            Ok(r) => {
-                println!("[+] Init Enclave Successful {}!", r.geteid());
-                r
-            }
-            Err(x) => {
-                panic!("[-] Init Enclave Failed {}!", x.as_str());
-            }
-        };
-        log::info!("Enclave intialization finished.");
-        let eid = enclave.geteid();
-
-        let mut retval = n;
-        let mut results_ptr = 0;
-        let result_code = unsafe { ecall_create_oram(eid, &mut retval, n, &mut results_ptr) };
-        match result_code {
-            sgx_status_t::SGX_SUCCESS => {}
-            _ => {
-                panic!("[-] ECALL Enclave Failed {}!", result_code.as_str());
-            }
-        }
-        let results_in_enclave = unsafe { Box::from_raw(results_ptr as *mut Vec<u8>) };
-        assert_eq!(results_in_enclave.len() % ANSWER_SIZE, 0);
-        let results = results_in_enclave
-            .chunks(ANSWER_SIZE)
-            .map(|x| x.to_vec())
-            .collect::<Vec<_>>();
-        std::mem::forget(results_in_enclave);
-        unsafe { ecall_release_results_space(eid, results_ptr) };
-
-        (enclave, eid, results)
-    }
-
-    let (mut enclave, mut eid, mut remaining_results) = init_enclave_and_oram(n);
+fn serve(mut enclave: SgxEnclave, mut eid: u64, mut remaining_results: Vec<Vec<u8>>) {
     println!("remaining_results = {:?}", remaining_results);
 
     let (shutdown_tx, shutdown_rx) = flume::unbounded();
@@ -292,7 +288,7 @@ fn main() {
             break;
         } else if counter % limit_enclave_crash == 0 && counter != 0 {
             enclave.destroy();
-            let mut t = init_enclave_and_oram(n);
+            let mut t = init_enclave_and_oram();
             enclave = t.0;
             eid = t.1;
             remaining_results.append(&mut t.2);
@@ -301,12 +297,21 @@ fn main() {
 
     shutdown_tx.send(()).unwrap();
     hd.join().unwrap();
-
-    //exercise_oram(10000, n, eid);
-    //sanity_check(eid);
-
     enclave.destroy();
     release_all_oram_storage();
+}
+
+fn main() {
+    let base_dir = std::env::current_dir().expect("not found path");
+    logger::initialize_loggers(base_dir.join("running.log"), LogLevel::Info);
+
+    let (enclave, eid, remaining_results) = init_enclave_and_oram();
+
+    serve(enclave, eid, remaining_results);
+    //exercise_oram(10000, n, eid);
+    //sanity_check(eid);
+    //enclave.destroy();
+    //release_all_oram_storage();
 
     //SGX_ERROR_INVALID_ENCLAVE_ID
 }
