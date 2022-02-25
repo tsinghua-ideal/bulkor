@@ -398,7 +398,7 @@ pub fn sanity_check(eid: sgx_enclave_id_t) {
     );
     assert_eq!(
         a64_bytes::<StorageBlockSize>(12).as_slice(),
-        &simple_access_wrapper(9, a64_bytes(13), eid, &mut rng)[..]
+        &simple_access_wrapper(9, a64_bytes(13), eid, &mut rng, &mut acc_dur)[..]
     );
 }
 
