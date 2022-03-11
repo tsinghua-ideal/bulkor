@@ -7,36 +7,42 @@
 
 use super::*;
 use crate::oram_storage::{persist_treetop, recover_treetop, s_decrypt, s_encrypt, ORAM_KEY};
-use crate::{NonceSize, SNAPSHOT_ID};
+use crate::{NonceSize, IS_LATEST, LIFETIME_ID, SNAPSHOT_ID};
 
 use aligned_cmov::{typenum::Unsigned, Aligned};
 use balanced_tree_index::TreeIndex;
 use std::convert::TryInto;
+use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 
 /// The HeapORAMStorage is simply vector
-pub struct HeapORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> {
+pub struct HeapORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned> {
     /// The current level of recursive ORAM
     level: u32,
     /// The storage for the blocks
-    data: Vec<A64Bytes<BlockSize>>,
+    pub data: Vec<A64Bytes<BlockSize>>,
     /// The storage for the metadata
-    metadata: Vec<A8Bytes<MetaSize>>,
+    pub metadata: Vec<A8Bytes<MetaSize>>,
     /// This is here so that we can provide good debug asserts in tests,
     /// it wouldn't be needed necessarily in a production version.
     checkout_index: Option<u64>,
+    _z: PhantomData<fn() -> Z>,
 }
 
-impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> HeapORAMStorage<BlockSize, MetaSize> {
+impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
+    HeapORAMStorage<BlockSize, MetaSize, Z>
+{
     pub fn new(level: u32, size: u64) -> Self {
         let snapshot_id = SNAPSHOT_ID.load(Ordering::SeqCst);
+        let is_latest = IS_LATEST.load(Ordering::SeqCst);
+        let lifetime_id = LIFETIME_ID.load(Ordering::SeqCst);
         let mut data = vec![Default::default(); size as usize];
         let mut metadata = vec![Default::default(); size as usize];
-        if snapshot_id > 0 {
+        if snapshot_id > 0 && (is_latest || level == 0) {
             let ns = NonceSize::USIZE;
-            let data_len = ns + 16 + 8 + 4 + size as usize * BlockSize::USIZE;
+            let data_len = ns + 16 + 8 + 4 + 8 + size as usize * BlockSize::USIZE;
             let mut data_buf = vec![0 as u8; data_len];
-            let meta_len = ns + 16 + 8 + 4 + size as usize * MetaSize::USIZE;
+            let meta_len = ns + 16 + 8 + 4 + 8 + size as usize * MetaSize::USIZE;
             let mut meta_buf = vec![0 as u8; meta_len];
 
             unsafe {
@@ -50,8 +56,8 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> HeapORAMStorage<Bloc
                 );
             }
 
-            s_decrypt(&ORAM_KEY, &mut data_buf, 12);
-            s_decrypt(&ORAM_KEY, &mut meta_buf, 12);
+            s_decrypt(&ORAM_KEY, &mut data_buf, 20);
+            s_decrypt(&ORAM_KEY, &mut meta_buf, 20);
 
             //check the integrity
             let loaded_snapshot_id =
@@ -60,20 +66,26 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> HeapORAMStorage<Bloc
             let loaded_level =
                 u32::from_le_bytes((&data_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
             assert_eq!(loaded_level, level);
+            let loaded_lifetime_id =
+                u64::from_le_bytes((&data_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
+            assert_eq!(loaded_lifetime_id, lifetime_id);
             let loaded_snapshot_id =
                 u64::from_le_bytes((&meta_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
             assert_eq!(loaded_snapshot_id, snapshot_id);
             let loaded_level =
                 u32::from_le_bytes((&meta_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
             assert_eq!(loaded_level, level);
+            let loaded_lifetime_id =
+                u64::from_le_bytes((&meta_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
+            assert_eq!(loaded_lifetime_id, lifetime_id);
 
-            let iter_data = (&data_buf[(ns + 28)..]).chunks_exact(BlockSize::USIZE);
+            let iter_data = (&data_buf[(ns + 36)..]).chunks_exact(BlockSize::USIZE);
             assert_eq!(iter_data.remainder(), []);
             data = iter_data
                 .into_iter()
                 .map(|d| Aligned(GenericArray::clone_from_slice(d)))
                 .collect::<Vec<_>>();
-            let iter_meta = (&meta_buf[(ns + 28)..]).chunks_exact(MetaSize::USIZE);
+            let iter_meta = (&meta_buf[(ns + 36)..]).chunks_exact(MetaSize::USIZE);
             assert_eq!(iter_meta.remainder(), []);
             metadata = iter_meta
                 .into_iter()
@@ -86,12 +98,13 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> HeapORAMStorage<Bloc
             data,
             metadata,
             checkout_index: None,
+            _z: Default::default(),
         }
     }
 }
 
-impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> ORAMStorage<BlockSize, MetaSize>
-    for HeapORAMStorage<BlockSize, MetaSize>
+impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
+    ORAMStorage<BlockSize, MetaSize, Z> for HeapORAMStorage<BlockSize, MetaSize, Z>
 {
     fn len(&self) -> u64 {
         self.data.len() as u64
@@ -139,6 +152,7 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> ORAMStorage<BlockSiz
 
     fn persist<Rng: RngCore + CryptoRng>(
         &mut self,
+        lifetime_id: u64,
         new_snapshot_id: u64,
         volatile: bool,
         rng: &mut Rng,
@@ -149,6 +163,7 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> ORAMStorage<BlockSiz
         let mut data = vec![0; NonceSize::USIZE + 16];
         data.extend_from_slice(&new_snapshot_id.to_le_bytes());
         data.extend_from_slice(&self.level.to_le_bytes());
+        data.extend_from_slice(&lifetime_id.to_le_bytes());
         for d in &self.data {
             data.extend_from_slice(d);
         }
@@ -156,12 +171,13 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> ORAMStorage<BlockSiz
         let mut meta = vec![0; NonceSize::USIZE + 16];
         meta.extend_from_slice(&new_snapshot_id.to_le_bytes());
         meta.extend_from_slice(&self.level.to_le_bytes());
+        meta.extend_from_slice(&lifetime_id.to_le_bytes());
         for m in &self.metadata {
             meta.extend_from_slice(m);
         }
 
-        s_encrypt(&ORAM_KEY, &mut data, 12, rng);
-        s_encrypt(&ORAM_KEY, &mut meta, 12, rng);
+        s_encrypt(&ORAM_KEY, &mut data, 20, rng);
+        s_encrypt(&ORAM_KEY, &mut meta, 20, rng);
 
         // TODO: the ocall should not stall the steps after it
         unsafe {
@@ -182,10 +198,13 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> ORAMStorage<BlockSiz
 /// initialization support
 pub struct HeapORAMStorageCreator {}
 
-impl<BlockSize: ArrayLength<u8> + 'static, MetaSize: ArrayLength<u8> + 'static>
-    ORAMStorageCreator<BlockSize, MetaSize> for HeapORAMStorageCreator
+impl<BlockSize, MetaSize, Z> ORAMStorageCreator<BlockSize, MetaSize, Z> for HeapORAMStorageCreator
+where
+    BlockSize: ArrayLength<u8> + 'static,
+    MetaSize: ArrayLength<u8> + 'static,
+    Z: Unsigned,
 {
-    type Output = HeapORAMStorage<BlockSize, MetaSize>;
+    type Output = HeapORAMStorage<BlockSize, MetaSize, Z>;
     type Error = HeapORAMStorageCreatorError;
 
     fn create<R: RngCore + CryptoRng>(

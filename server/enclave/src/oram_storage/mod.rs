@@ -30,25 +30,34 @@
 
 use std::cmp::max;
 use std::convert::TryInto;
-use std::ops::Add;
+use std::marker::PhantomData;
+use std::ops::{Add, Div};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::SgxMutex as Mutex;
 use std::vec::Vec;
 
 use aes::cipher::{NewCipher, StreamCipher};
 use aes_gcm::aead::{Aead, NewAead};
-use aligned_cmov::{typenum, A64Bytes, A8Bytes, ArrayLength, GenericArray};
+use aligned_cmov::{
+    subtle::ConstantTimeEq,
+    typenum::{PartialDiv, PowerOfTwo, Quot, Sum, Unsigned, U8},
+    A64Bytes, A8Bytes, ArrayLength, GenericArray,
+};
 use balanced_tree_index::TreeIndex;
 use displaydoc::Display;
 use rand_core::{CryptoRng, RngCore};
-use subtle::ConstantTimeEq;
-use typenum::{PartialDiv, PowerOfTwo, Sum, Unsigned, U8};
 
+use crate::oram_storage::shuffle_manager::manage;
 use crate::oram_traits::{HeapORAMStorage, ORAMStorage, ORAMStorageCreator};
-use crate::{AuthCipherType, AuthNonceSize, CipherType, KeySize, NonceSize, SNAPSHOT_ID};
+use crate::{
+    AuthCipherType, AuthNonceSize, CipherType, KeySize, NonceSize, IS_LATEST, LIFETIME_ID,
+    SNAPSHOT_ID,
+};
 
 mod extra_meta;
 pub use extra_meta::{compute_block_hash, compute_slices_hash, ExtraMeta, ExtraMetaSize, Hash};
+mod shuffle_manager;
+use shuffle_manager::BIN_SIZE_IN_BLOCK;
 
 lazy_static! {
     /// The tree-top caching threshold, specified as log2 of a number of bytes.
@@ -165,11 +174,14 @@ pub fn s_decrypt(key: &GenericArray<u8, KeySize>, ct: &mut [u8], skip_enc: usize
 /// An ORAMStorage type which stores data with untrusted storage, over an OCALL.
 /// This must encrypt the data which is stored, and authenticate the data when
 /// it returns.
-pub struct OcallORAMStorage<DataSize, MetaSize>
+pub struct OcallORAMStorage<DataSize, MetaSize, Z>
 where
-    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + Add<ExtraMetaSize>,
+    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z>,
+    Z: Unsigned,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
+    Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
     /// The current level of recursive ORAM
     level: u32,
@@ -183,7 +195,7 @@ where
     // This must never change after construction.
     treetop_max_count: u64,
     // The storage on the heap for the top of the tree
-    treetop: HeapORAMStorage<DataSize, MetaSize>,
+    treetop: HeapORAMStorage<DataSize, MetaSize, Z>,
     // The trusted merkle roots of trees rooted just below the treetop
     trusted_merkle_roots: Vec<Hash>,
     // A temporary scratch buffer for use when getting metadata from untrusted and validating it
@@ -194,13 +206,17 @@ where
     // The key we use when hashing ciphertexts to make merkle tree
     // Keeping this secret makes the hash functionally a mac
     hash_key: GenericArray<u8, KeySize>,
+    _z: PhantomData<fn() -> Z>,
 }
 
-impl<DataSize, MetaSize> OcallORAMStorage<DataSize, MetaSize>
+impl<DataSize, MetaSize, Z> OcallORAMStorage<DataSize, MetaSize, Z>
 where
-    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + Add<ExtraMetaSize>,
+    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z>,
+    Z: Unsigned,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
+    Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
     /// Create a new oram storage object for count items, with particular RNG
     pub fn new<Rng: RngCore + CryptoRng>(level: u32, count: u64, rng: &mut Rng) -> Self {
@@ -213,49 +229,22 @@ where
         );
 
         let snapshot_id = SNAPSHOT_ID.load(Ordering::SeqCst);
-        let mut allocation_id = 0u64;
-        //TODO: snapshot the previous in-memory/on-disk ORAM tree
-        //Otherwise, it cannot recover correctly if the system does not stop at the F/SL_PERSIST_SIZE.
-        let treetop = {
-            //recovery is included in allocation
-            unsafe {
-                allocate_oram_storage(
-                    level,
-                    snapshot_id,
-                    count,
-                    DataSize::U64,
-                    MetaSize::U64 + ExtraMetaSize::U64,
-                    &mut allocation_id,
-                );
-            }
+        let is_latest = IS_LATEST.load(Ordering::SeqCst);
+        let lifetime_id = LIFETIME_ID.load(Ordering::SeqCst);
 
-            if allocation_id == 0 {
-                panic!("Untrusted could not allocate storage! count = {}, data_size = {}, meta_size + extra_meta_size = {}",
-                       count,
-                       DataSize::U64,
-                       MetaSize::U64 + ExtraMetaSize::U64)
-            }
-            if count <= treetop_max_count {
-                HeapORAMStorage::new(level, count)
-            } else {
-                HeapORAMStorage::new(level, treetop_max_count)
-            }
-        };
-        println!("Finish ORAM allocation");
-
-        let trusted_merkle_roots = if count <= treetop_max_count {
+        let mut trusted_merkle_roots = if count <= treetop_max_count {
             Default::default()
         } else {
             let mut v = vec![Default::default(); (treetop_max_count * 2) as usize];
-            if snapshot_id > 0 {
+            if snapshot_id > 0 && (is_latest || level == 0) {
                 let ns = NonceSize::USIZE;
-                let roots_len = ns + 16 + 8 + 4 + 8 + v.len() * 16; //add count to be checked
-                                                                    //The correct count also ensure the correct height in pos map
+                let roots_len = ns + 16 + 8 + 4 + 8 + 8 + v.len() * 16; //add count to be checked
+                                                                        //The correct count also ensure the correct height in pos map
                 let mut roots_buf = vec![0 as u8; roots_len];
                 unsafe {
                     recover_merkle_roots(roots_buf.as_mut_ptr(), roots_len, level, snapshot_id);
                 }
-                s_decrypt(&ORAM_KEY, &mut roots_buf, 20);
+                s_decrypt(&ORAM_KEY, &mut roots_buf, 28);
                 //check the integrity
                 let loaded_snapshot_id =
                     u64::from_le_bytes((&roots_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
@@ -266,7 +255,11 @@ where
                 let loaded_count =
                     u64::from_le_bytes((&roots_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
                 assert_eq!(loaded_count, count);
-                let iter_data = (&roots_buf[(ns + 36)..]).chunks_exact(16);
+                let loaded_lifetime_id =
+                    u64::from_le_bytes((&roots_buf[(ns + 36)..(ns + 44)]).try_into().unwrap());
+                assert_eq!(loaded_lifetime_id, lifetime_id);
+
+                let iter_data = (&roots_buf[(ns + 44)..]).chunks_exact(16);
                 assert_eq!(iter_data.remainder(), []);
                 v = iter_data
                     .into_iter()
@@ -276,6 +269,33 @@ where
             v
         };
 
+        let mut treetop = {
+            if count <= treetop_max_count {
+                HeapORAMStorage::new(level, count)
+            } else {
+                HeapORAMStorage::new(level, treetop_max_count)
+            }
+        };
+        //recovery is included in allocation
+        let mut allocation_id = 0u64;
+        unsafe {
+            allocate_oram_storage(
+                level,
+                snapshot_id,
+                is_latest as u8,
+                count,
+                DataSize::U64,
+                MetaSize::U64 + ExtraMetaSize::U64,
+                &mut allocation_id,
+            );
+        }
+        if allocation_id == 0 {
+            panic!("Untrusted could not allocate storage! count = {}, data_size = {}, meta_size + extra_meta_size = {}",
+                    count,
+                    DataSize::U64,
+                    MetaSize::U64 + ExtraMetaSize::U64)
+        }
+
         //Recover the keys
         let aes_key: GenericArray<u8, KeySize> = ORAM_KEY.clone();
         let hash_key: GenericArray<u8, KeySize> = ORAM_KEY.clone();
@@ -283,6 +303,27 @@ where
         // rng.fill_bytes(aes_key.as_mut_slice());
         // let mut hash_key = GenericArray::<u8, KeySize>::default();
         // rng.fill_bytes(hash_key.as_mut_slice());
+
+        //shuffle the oram tree if necessary
+        if snapshot_id > 0 && !is_latest && level == 0 {
+            let mut shuffle_id = 0;
+            unsafe {
+                allocate_shuffle_manager(allocation_id, Z::U64, BIN_SIZE_IN_BLOCK, &mut shuffle_id);
+            }
+            manage(
+                shuffle_id,
+                &mut allocation_id,
+                count,
+                treetop_max_count as usize,
+                &mut treetop,
+                &mut trusted_merkle_roots,
+                &aes_key,
+                &hash_key,
+                rng,
+            );
+        }
+
+        println!("Finish ORAM allocation");
 
         Self {
             level,
@@ -294,6 +335,7 @@ where
             meta_scratch_buffer: Default::default(),
             aes_key,
             hash_key,
+            _z: Default::default(),
         }
     }
 
@@ -303,11 +345,15 @@ where
     }
 }
 
-impl<DataSize, MetaSize> ORAMStorage<DataSize, MetaSize> for OcallORAMStorage<DataSize, MetaSize>
+impl<DataSize, MetaSize, Z> ORAMStorage<DataSize, MetaSize, Z>
+    for OcallORAMStorage<DataSize, MetaSize, Z>
 where
-    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + Add<ExtraMetaSize>,
+    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z>,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z>,
+    Z: Unsigned,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
+    Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
     fn len(&self) -> u64 {
         self.count
@@ -374,8 +420,8 @@ where
                 // If untrusted gave us all 0's for the metadata, then the result is all zeroes
                 // Otherwise we have to decrypt
                 if self.meta_scratch_buffer[idx] == Default::default() {
-                    dest[idx] = Default::default();
-                    dest_meta[idx] = Default::default();
+                    //dest[idx] = Default::default();
+                    //dest_meta[idx] = Default::default();
                     last_hash = Some((indices[idx], Default::default()));
                 } else {
                     // Compute the hash for this block
@@ -404,7 +450,7 @@ where
                     }
 
                     // Check with trusted merkle root if this is the last treetop index
-                    if idx == first_treetop_index
+                    if idx == first_treetop_index - 1
                         && !bool::from(
                             self.trusted_merkle_roots[indices[idx] as usize]
                                 .ct_eq(&this_block_hash),
@@ -544,6 +590,7 @@ where
 
     fn persist<Rng: RngCore + CryptoRng>(
         &mut self,
+        lifetime_id: u64,
         new_snapshot_id: u64,
         volatile: bool,
         rng: &mut Rng,
@@ -556,18 +603,20 @@ where
                 self.allocation_id,
             )
         };
-        self.treetop.persist(new_snapshot_id, volatile, rng);
+        self.treetop
+            .persist(lifetime_id, new_snapshot_id, volatile, rng);
         //encrypt the merkle roots and send it out
         //TODO: This step can be in parallel with the following ones
         let mut roots = vec![0; NonceSize::USIZE + 16];
         roots.extend_from_slice(&new_snapshot_id.to_le_bytes());
         roots.extend_from_slice(&self.level.to_le_bytes());
         roots.extend_from_slice(&self.count.to_le_bytes());
+        roots.extend_from_slice(&lifetime_id.to_le_bytes());
         for d in &self.trusted_merkle_roots {
             roots.extend_from_slice(d);
         }
 
-        s_encrypt(&ORAM_KEY, &mut roots, 20, rng);
+        s_encrypt(&ORAM_KEY, &mut roots, 28, rng);
 
         // TODO: the ocall should not stall the steps after it
         unsafe {
@@ -585,13 +634,16 @@ where
 /// An ORAMStorageCreator for the Ocall-based storage type
 pub struct OcallORAMStorageCreator;
 
-impl<DataSize, MetaSize> ORAMStorageCreator<DataSize, MetaSize> for OcallORAMStorageCreator
+impl<DataSize, MetaSize, Z> ORAMStorageCreator<DataSize, MetaSize, Z> for OcallORAMStorageCreator
 where
-    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + 'static,
-    MetaSize: ArrayLength<u8> + Add<ExtraMetaSize> + 'static,
+    DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z> + 'static,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z> + 'static,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8> + 'static,
+    Z: Unsigned + 'static,
+    Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned + 'static,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned + 'static,
 {
-    type Output = OcallORAMStorage<DataSize, MetaSize>;
+    type Output = OcallORAMStorage<DataSize, MetaSize, Z>;
     type Error = UntrustedStorageError;
 
     fn create<Rng: RngCore + CryptoRng>(
@@ -670,10 +722,17 @@ extern "C" {
     fn allocate_oram_storage(
         level: u32,
         snapshot_id: u64,
+        is_latest: u8,
         count: u64,
         data_size: u64,
         meta_size: u64,
         id: *mut u64,
+    );
+    fn allocate_shuffle_manager(
+        allocation_id: u64,
+        z: u64,
+        bin_size_in_block: usize,
+        shuffle_id: *mut u64,
     );
     fn persist_oram_storage(level: u32, snapshot_id: u64, is_volatile: u8, id: u64);
     fn checkout_oram_storage(
@@ -694,7 +753,11 @@ extern "C" {
         metabuf: *const u8,
         metabuf_size: usize,
     );
-    pub fn get_valid_snapshot_id(size_triv_pos_map: u64, snapshot_id: *mut u64);
+    pub fn get_valid_snapshot_id(
+        size_triv_pos_map: u64,
+        snapshot_id: *mut u64,
+        lifetime_id_from_meta: *mut u64,
+    );
     pub fn persist_stash(
         new_stash_data: *const u8,
         new_stash_data_len: usize,

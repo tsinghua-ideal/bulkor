@@ -36,7 +36,7 @@ use std::sgxfs::{OpenOptions, SgxFile};
 use std::slice;
 use std::string::{String, ToString};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, SgxMutex as Mutex, SgxRwLock as RwLock,
 };
 use std::time::Instant;
@@ -55,6 +55,8 @@ use aligned_cmov::{
 
 mod allocator;
 use allocator::Allocator;
+mod custom_counter;
+use custom_counter::check_counter;
 use sgx_types::sgx_status_t;
 mod oram_manager;
 use oram_manager::{PathORAM, PathORAM4096Z4Creator, POS_MAP_THRESHOLD};
@@ -102,7 +104,7 @@ type ORAMClass = PathORAM<
     StorageBlockSize,
     StorageBlockMetaSize,
     StorageZ,
-    OcallORAMStorage<StorageBucketSize, StorageBucketMetaSize>,
+    OcallORAMStorage<StorageBucketSize, StorageBucketMetaSize, StorageZ>,
     RngType,
 >;
 
@@ -115,6 +117,11 @@ lazy_static! {
     static ref QUERY_CNT: AtomicU64 = AtomicU64::new(0u64);
     /// Snapshot id, based on which the ORAMs are recovered or created
     static ref SNAPSHOT_ID: AtomicU64 = AtomicU64::new(0u64);
+    /// Whether the counter match the latest monotonic counter and
+    /// the lifetime persisted metadata match that recorded in the last log entry
+    static ref IS_LATEST: AtomicBool = AtomicBool::new(true);
+    /// Lifetime id, the number kept between two shuffles
+    static ref LIFETIME_ID: AtomicU64 = AtomicU64::new(0u64);
     /// Snapshot id to log position
     static ref ID_TO_LOG_POS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
     /// Logging lock
@@ -125,20 +132,31 @@ lazy_static! {
 #[no_mangle]
 pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
     let mut lk = ORAM_OBJ.lock().unwrap();
+    assert!(lk.is_none());
 
     let mut log = OpenOptions::new()
         .read(true)
         .open_ex("log", &ORAM_KEY.clone().into())
         .ok();
     let mut log_len = 0;
+    let mut lifetime_id_from_log = 0;
+    let mut lifetime_id_from_meta = 0;
     let mut query_cnt = 0;
+    //TODO: get timestamp from log
+    let mut loaded_timestamp = 0;
     log.as_mut().map(|l| {
-        log_len = l.seek(SeekFrom::End(-8)).unwrap() + 8;
+        log_len = l.seek(SeekFrom::End(-16)).unwrap() + 16;
+        let mut lifetime_id_buf = [0; 8];
         let mut query_cnt_buf = [0; 8];
+        l.read_exact(&mut lifetime_id_buf).unwrap();
         l.read_exact(&mut query_cnt_buf).unwrap();
+        lifetime_id_from_log = u64::from_le_bytes(lifetime_id_buf);
         query_cnt = u64::from_le_bytes(query_cnt_buf);
     });
-    //TODO: check the log counter with the monotonic counter
+
+    // There is a case that query_cnt is stale, then the subsequent new snapshot after
+    // recovery may have the same snapshot id with some old one, this will be detected
+    // by the method in LCM (DSN’17), which we integrite into our system
     QUERY_CNT.store(query_cnt, Ordering::SeqCst);
     println!("loaded query_cnt = {:?}", query_cnt);
 
@@ -149,20 +167,41 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
         size_triv_pos_map >>= log2_ceil(StorageBlockSize::U64) - 2;
     }
     //NOTE: should be consistent with `posmap_len` in position_map.rs
-    size_triv_pos_map = NonceSize::U64 + 16 + 8 + 8 + size_triv_pos_map * 4;
+    size_triv_pos_map = NonceSize::U64 + 16 + 8 + 8 + 8 + size_triv_pos_map * 4;
     unsafe {
         //The last persisted state should be the trivial position map
         //So if the file is not broken, the newest valid snapshot id can be gotten
         //It is secure, because we further check the snapshot_id when loading metadata.
         //And it does not matter whether the snapshot id is the newest.
-        get_valid_snapshot_id(size_triv_pos_map, &mut snapshot_id);
+        get_valid_snapshot_id(
+            size_triv_pos_map,
+            &mut snapshot_id,
+            &mut lifetime_id_from_meta,
+        );
     }
     SNAPSHOT_ID.store(snapshot_id, Ordering::SeqCst);
     println!("get_valid_snapshot_id = {:?}", snapshot_id);
+
+    //TODO: get current timestamp from clients
+    let mut cur_timestamp = 0;
+
+    //Not only the log entry should meet the requirement, the loaded metadata should also
+    //match the lifetime, except for snapshot == 0.
+    let is_latest = check_counter(loaded_timestamp, cur_timestamp)
+        && (lifetime_id_from_log == lifetime_id_from_meta || snapshot_id == 0);
+    IS_LATEST.store(is_latest, Ordering::SeqCst);
+    let lifetime_id = if is_latest && lifetime_id_from_log != 0 {
+        lifetime_id_from_log
+    } else {
+        cur_timestamp
+    };
+    LIFETIME_ID.store(lifetime_id, Ordering::SeqCst);
+
     let rng = get_seeded_rng();
     let mut new_oram = ORAMCreatorClass::create(n, STASH_SIZE, &mut rng_maker(rng));
 
-    //replay the log since the loaded snapshot id
+    //load the unfinished queries since the loaded snapshot id
+    //TODO: if new_pos is logged and !is_latest, the new_pos should be ignored
     let log_pos = ID_TO_LOG_POS
         .lock()
         .unwrap()
@@ -190,21 +229,28 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
     let mut results = vec![];
     ALLOCATOR.set_switch(false);
 
+    //begin to replay the queries
     let mut cur_q = 0;
     while cur_q < queries_buf.len() {
         //read batch size
         let mut batch_size_buf = [0; 8];
         batch_size_buf.copy_from_slice(&queries_buf[cur_q..(cur_q + 8)]);
         let batch_size = u64::from_le_bytes(batch_size_buf) as usize;
-        cur_q += 8;
+        cur_q += 8 + batch_size * QUERY_SIZE;
+        //read lifetime id
+        let mut lifetime_id_buf = [0; 8];
+        lifetime_id_buf.copy_from_slice(&queries_buf[cur_q..(cur_q + 8)]);
+        if u64::from_le_bytes(lifetime_id_buf) < lifetime_id {
+            //TODO: ignore the recorded pos
+        }
         //process batch
         let mut answers = vec![0; batch_size * ANSWER_SIZE];
         process_batch(
             &mut new_oram,
-            &queries_buf[cur_q..(cur_q + batch_size * QUERY_SIZE)],
+            &queries_buf[(cur_q - batch_size * QUERY_SIZE)..cur_q],
             &mut answers,
         );
-        cur_q += batch_size * QUERY_SIZE;
+        cur_q += 8;
         // no need to store QUERY_CNT, since it has the newest cnt
         // let mut query_cnt_buf = [0; 8];
         // query_cnt_buf.copy_from_slice(&queries_buf[cur_q..(cur_q + 8)]);
@@ -222,15 +268,8 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
     ALLOCATOR.set_switch(false);
     unsafe { *results_ptr = ptr };
 
-    let is_some = lk.is_some();
-    let mut cur_n = n;
-    if is_some {
-        cur_n = lk.as_ref().map(|cur_oram| cur_oram.len()).unwrap();
-    } else {
-        *lk = Some(new_oram);
-    }
-
-    return cur_n;
+    *lk = Some(new_oram);
+    lk.as_ref().map(|cur_oram| cur_oram.len()).unwrap()
 }
 
 #[no_mangle]
@@ -275,7 +314,8 @@ pub extern "C" fn ecall_access(
     cur_query_cnt += batch_size as u64;
     QUERY_CNT.store(cur_query_cnt, Ordering::SeqCst);
     println!("cur_query_cnt = {:?}", cur_query_cnt);
-
+    let lifetime_id = LIFETIME_ID.load(Ordering::SeqCst);
+    //TODO: get timestamp and log timestamp
     let cur_log_pos = {
         let mut log = OpenOptions::new()
             .append(true)
@@ -283,8 +323,8 @@ pub extern "C" fn ecall_access(
             .unwrap();
         log.write_all(&batch_size.to_le_bytes()).unwrap();
         log.write_all(bytes).unwrap(); //bytes have been decrypted
+        log.write_all(&lifetime_id.to_le_bytes()).unwrap();
         log.write_all(&cur_query_cnt.to_le_bytes()).unwrap();
-
         //TODO: some other information may be logged per batch
         log.stream_position().unwrap()
     };
@@ -298,12 +338,12 @@ pub extern "C" fn ecall_access(
     {
         let cur_oram = qlk.as_mut().unwrap();
         process_batch(cur_oram, bytes, answers_slice);
-        if cur_batch_cnt % SL_PERSIST_SIZE == 0 {
+        if (cur_batch_cnt % SL_PERSIST_SIZE == 0) || !IS_LATEST.swap(true, Ordering::SeqCst) {
             println!("begin SL_PERSIST, cur_query_cnt = {:?}", cur_query_cnt);
-            cur_oram.persist(cur_query_cnt, false);
+            cur_oram.persist(lifetime_id, cur_query_cnt, false);
         } else if cur_batch_cnt % FL_PERSIST_SIZE == 0 {
             println!("begin FL_PERSIST, cur_query_cnt = {:?}", cur_query_cnt);
-            cur_oram.persist(cur_query_cnt, true);
+            cur_oram.persist(lifetime_id, cur_query_cnt, true);
         }
     };
     drop(qlk); //release the querylock

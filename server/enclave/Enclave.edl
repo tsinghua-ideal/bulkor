@@ -73,10 +73,14 @@ enclave {
         /// Thread safety: This call is thread-safe unconditionally
         void allocate_oram_storage(uint32_t level,
                                    uint64_t snapshot_id,
+                                   uint8_t is_latest,
                                    uint64_t count,
                                    uint64_t data_size,
                                    uint64_t meta_size,
                                    [out] uint64_t * id);
+
+        /// Prepare for global shuffle on ORAM indexed by allocation_id
+        void allocate_shuffle_manager(uint64_t allocation_id, uint64_t z, size_t bin_size_in_block, [out] uint64_t * shuffle_id);
 
         /// Ask untrusted to persist oram storage
         void persist_oram_storage(uint32_t level,
@@ -145,7 +149,8 @@ enclave {
         ///
         /// Thread safety: This call is thread-safe unconditionally
         void get_valid_snapshot_id(uint64_t size_triv_pos_map,
-                                   [out] uint64_t * snapshot_id);  
+                                   [out] uint64_t * snapshot_id,
+                                   [out] uint64_t * lifetime_id_from_meta);  
 
         /// Persist the stash, and save to files if necessary
         /// 
@@ -228,7 +233,55 @@ enclave {
         void recover_trivial_posmap([out, count=posmap_len] uint8_t * posmap,
                             size_t posmap_len,
                             uint64_t snapshot_id); 
+
+        void shuffle_pull_buckets(uint64_t shuffle_id,
+            size_t b_idx,
+            size_t e_idx,
+            [out, count=data_size] uint8_t * data,
+            size_t data_size,
+            [out, count=meta_size] uint8_t * meta,
+            size_t meta_size);
+
+        void shuffle_pull_bin(uint64_t shuffle_id,
+            size_t cur_bin_num,
+            uint8_t bin_type,
+            [out] size_t * bin_size,
+            [out, count=data_size] uint8_t * data,
+            size_t data_size,
+            [out, count=meta_size] uint8_t * meta,
+            size_t meta_size,
+            [out, count=random_key_size] uint8_t * random_key,
+            size_t random_key_size,
+            [out, count=nonce_size] uint8_t * nonce,
+            size_t nonce_size,
+            [out, count=hash_size] uint8_t * hash,
+            size_t hash_size);
+
+        void shuffle_push_buckets(uint64_t shuffle_id,
+            size_t b_idx,
+            size_t e_idx,
+            [in, count=data_size] const uint8_t * data,
+            size_t data_size,
+            [in, count=meta_size] const uint8_t * meta,
+            size_t meta_size);
         
+        void shuffle_push_bin(uint64_t shuffle_id,
+            size_t cur_bin_num,
+            uint8_t bin_type,
+            [in, count=data_size] const uint8_t * data,
+            size_t data_size,
+            [in, count=meta_size] const uint8_t * meta,
+            size_t meta_size,
+            [in, count=random_key_size] const uint8_t * random_key,
+            size_t random_key_size,
+            [in, count=nonce_size] const uint8_t * nonce,
+            size_t nonce_size,
+            [in, count=hash_size] const uint8_t * hash,
+            size_t hash_size);
+
+        void bin_switch(size_t begin_bin_idx, size_t end_bin_idx);
+
+        void get_oram_tree(uint64_t shuffle_id, [out] uint64_t * allocation_id);
     };
 
 };

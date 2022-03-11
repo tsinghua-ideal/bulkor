@@ -15,9 +15,9 @@
 
 use super::*;
 
-use std::boxed::Box;
-use std::fmt::{Display, Debug};
 use rand_core::SeedableRng;
+use std::boxed::Box;
+use std::fmt::{Debug, Display};
 
 /// A factory which creates an ORAM of arbitrary size using recursive strategy.
 /// The result is required to have the 'static lifetime, and not be tied to the
@@ -53,9 +53,9 @@ pub trait PositionMapCreator<RngType: RngCore + CryptoRng> {
 /// wrapping a vector, or e.g. they hold integer handles which they use when
 /// they make OCALL's to untrusted.
 /// So there is no manager object in the enclave which they cannot outlive.
-pub trait ORAMStorageCreator<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> {
+pub trait ORAMStorageCreator<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned> {
     /// The storage type produced
-    type Output: ORAMStorage<BlockSize, MetaSize> + Send + Sync + 'static;
+    type Output: ORAMStorage<BlockSize, MetaSize, Z> + Send + Sync + 'static;
     /// The error type produced
     type Error: Display + Debug;
 

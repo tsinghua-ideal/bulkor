@@ -39,7 +39,7 @@ impl<ValueSize: ArrayLength<u8>> ORAM<ValueSize> for LinearScanningORAM<ValueSiz
         result
     }
 
-    fn persist(&mut self, new_snapshot_id: u64, volatile: bool) {
+    fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool) {
         unimplemented!()
     }
 }

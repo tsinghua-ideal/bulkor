@@ -48,7 +48,7 @@ type PosMetaSize = U16;
 struct PathORAM4096Z2Creator<R, SC>
 where
     R: RngCore + CryptoRng + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U2, DataMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U2, DataMetaSize>, U2>,
 {
     _rng: PhantomData<fn() -> R>,
     _sc: PhantomData<fn() -> SC>,
@@ -57,7 +57,7 @@ where
 impl<R, SC> ORAMCreator<U2048, R> for PathORAM4096Z2Creator<R, SC>
 where
     R: RngCore + CryptoRng + Send + Sync + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U2, DataMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U2, DataMetaSize>, U2>,
 {
     type Output = PathORAM<U2048, DataMetaSize, U2, SC::Output, R>;
 
@@ -77,7 +77,7 @@ where
 struct RecPathORAM4096Z2Creator<R, SC>
 where
     R: RngCore + CryptoRng + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U2, PosMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U2, PosMetaSize>, U2>,
 {
     _rng: PhantomData<fn() -> R>,
     _sc: PhantomData<fn() -> SC>,
@@ -86,7 +86,7 @@ where
 impl<R, SC> ORAMCreator<U2048, R> for RecPathORAM4096Z2Creator<R, SC>
 where
     R: RngCore + CryptoRng + Send + Sync + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U2, PosMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U2, PosMetaSize>, U2>,
 {
     type Output = PathORAM<U2048, PosMetaSize, U2, SC::Output, R>;
 
@@ -104,7 +104,7 @@ where
 pub struct PathORAM4096Z4Creator<R, SC>
 where
     R: RngCore + CryptoRng + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U4, DataMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U4, DataMetaSize>, U4>,
 {
     _rng: PhantomData<fn() -> R>,
     _sc: PhantomData<fn() -> SC>,
@@ -113,7 +113,7 @@ where
 impl<R, SC> ORAMCreator<U1024, R> for PathORAM4096Z4Creator<R, SC>
 where
     R: RngCore + CryptoRng + Send + Sync + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U4, DataMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U4, DataMetaSize>, U4>,
 {
     type Output = PathORAM<U1024, DataMetaSize, U4, SC::Output, R>;
 
@@ -133,7 +133,7 @@ where
 pub struct RecPathORAM4096Z4Creator<R, SC>
 where
     R: RngCore + CryptoRng + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U4, PosMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U4, PosMetaSize>, U4>,
 {
     _rng: PhantomData<fn() -> R>,
     _sc: PhantomData<fn() -> SC>,
@@ -142,7 +142,7 @@ where
 impl<R, SC> ORAMCreator<U1024, R> for RecPathORAM4096Z4Creator<R, SC>
 where
     R: RngCore + CryptoRng + Send + Sync + 'static,
-    SC: ORAMStorageCreator<U4096, Prod<U4, PosMetaSize>>,
+    SC: ORAMStorageCreator<U4096, Prod<U4, PosMetaSize>, U4>,
 {
     type Output = PathORAM<U1024, PosMetaSize, U4, SC::Output, R>;
 

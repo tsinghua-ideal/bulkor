@@ -12,7 +12,7 @@ use std::vec::Vec;
 // Re-export some traits we depend on, so that downstream can ensure that they
 // have the same version as us.
 pub use aligned_cmov::{
-    cswap, subtle, typenum, A64Bytes, A8Bytes, ArrayLength, CMov, GenericArray,
+    cswap, subtle, typenum::Unsigned, A64Bytes, A8Bytes, ArrayLength, CMov, GenericArray,
 };
 pub use rand_core::{CryptoRng, RngCore};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
@@ -47,7 +47,7 @@ pub mod testing;
 /// TODO: Create an API that allows checking out from two branches
 /// simultaneously.
 #[allow(clippy::len_without_is_empty)]
-pub trait ORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> {
+pub trait ORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned> {
     /// Get the number of blocks represented by this block storage
     /// This is also the bound of the largest valid index
     fn len(&self) -> u64;
@@ -99,6 +99,7 @@ pub trait ORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>> {
     /// * rng: since storages themselves do not have rng, they rely on oram engine to provide it
     fn persist<Rng: RngCore + CryptoRng>(
         &mut self,
+        lifetime_id: u64,
         new_snapshot_id: u64,
         volatile: bool,
         rng: &mut Rng,
@@ -164,7 +165,7 @@ pub trait ORAM<ValueSize: ArrayLength<u8>> {
     }
 
     /// This is the API for persisting the ORAM metadata, including stash and pos map
-    fn persist(&mut self, new_snapshot_id: u64, volatile: bool);
+    fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool);
 }
 
 /// Trait that helps to debug ORAM.
@@ -207,7 +208,7 @@ pub trait PositionMap {
     fn write(&mut self, key: &u64, new_val: &u64) -> u64;
 
     /// This is the API for persisting the ORAM metadata, including stash and pos map
-    fn persist(&mut self, new_snapshot_id: u64, volatile: bool);
+    fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool);
 }
 
 /// Utility function for logs base 2 rounded up, implemented as const fn

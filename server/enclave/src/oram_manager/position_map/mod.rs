@@ -25,7 +25,7 @@ use crate::oram_storage::{
     persist_trivial_posmap, recover_trivial_posmap, s_decrypt, s_encrypt, ORAM_KEY,
 };
 use crate::oram_traits::{log2_ceil, ORAMCreator, PositionMap, PositionMapCreator, ORAM};
-use crate::{NonceSize, ID_TO_LOG_POS, SNAPSHOT_ID};
+use crate::{NonceSize, ID_TO_LOG_POS, SNAPSHOT_ID, IS_LATEST, LIFETIME_ID};
 
 /// This threshold is a total guess, this corresponds to four pages
 pub const POS_MAP_THRESHOLD: u64 = 4096;
@@ -48,26 +48,31 @@ impl<R: RngCore + CryptoRng> TrivialPositionMap<R> {
 
         let mut data = vec![0u32; size as usize];
         let snapshot_id = SNAPSHOT_ID.load(Ordering::SeqCst);
-        if snapshot_id > 0 {
+        let is_latest = IS_LATEST.load(Ordering::SeqCst);
+        let lifetime_id = LIFETIME_ID.load(Ordering::SeqCst);
+        if snapshot_id > 0 && is_latest {
             let ns = NonceSize::USIZE;
             //NOTE: should be consistent with `size_triv_pos_map` in lib.rs
-            let posmap_len = ns + 16 + 8 + 8 + size as usize * 4; //no level, but have log pos
+            let posmap_len = ns + 16 + 8 + 8 + 8 + size as usize * 4; //no level, but have log pos
             let mut posmap_buf = vec![0 as u8; posmap_len];
             unsafe {
                 recover_trivial_posmap(posmap_buf.as_mut_ptr(), posmap_len, snapshot_id);
             }
-            s_decrypt(&ORAM_KEY, &mut posmap_buf, 16);
+            s_decrypt(&ORAM_KEY, &mut posmap_buf, 24);
             let loaded_log_pos =
                 u64::from_le_bytes((&posmap_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
             //check the integrity
             let loaded_snapshot_id =
                 u64::from_le_bytes((&posmap_buf[(ns + 24)..(ns + 32)]).try_into().unwrap());
             assert_eq!(loaded_snapshot_id, snapshot_id);
+            let loaded_lifetime_id = 
+                u64::from_le_bytes((&posmap_buf[(ns + 32)..(ns + 40)]).try_into().unwrap());
+            assert_eq!(loaded_lifetime_id, lifetime_id);
             ID_TO_LOG_POS
                 .lock()
                 .unwrap()
                 .insert(snapshot_id, loaded_log_pos);
-            let iter_data = (&posmap_buf[(ns + 32)..]).chunks_exact(4);
+            let iter_data = (&posmap_buf[(ns + 40)..]).chunks_exact(4);
             assert_eq!(iter_data.remainder(), []);
             data = iter_data
                 .into_iter()
@@ -105,7 +110,7 @@ impl<R: RngCore + CryptoRng> PositionMap for TrivialPositionMap<R> {
         old_val as u64
     }
 
-    fn persist(&mut self, new_snapshot_id: u64, volatile: bool) {
+    fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool) {
         //encrypt the merkle roots and send it out
         //TODO: This step can be in parallel with the following ones
         let mut posmap = vec![0; NonceSize::USIZE + 16];
@@ -116,11 +121,12 @@ impl<R: RngCore + CryptoRng> PositionMap for TrivialPositionMap<R> {
             .unwrap();
         posmap.extend_from_slice(&cur_log_pos.to_le_bytes());
         posmap.extend_from_slice(&new_snapshot_id.to_le_bytes());
+        posmap.extend_from_slice(&lifetime_id.to_le_bytes());
         for d in &self.data {
             posmap.extend_from_slice(&d.to_le_bytes());
         }
 
-        s_encrypt(&ORAM_KEY, &mut posmap, 16, &mut self.rng);
+        s_encrypt(&ORAM_KEY, &mut posmap, 24, &mut self.rng);
 
         // TODO: the ocall should not stall the steps after it
         unsafe {
@@ -210,8 +216,8 @@ where
         old_val as u64
     }
 
-    fn persist(&mut self, new_snapshot_id: u64, volatile: bool) {
-        self.oram.persist(new_snapshot_id, volatile);
+    fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool) {
+        self.oram.persist(lifetime_id, new_snapshot_id, volatile);
     }
 }
 

@@ -41,6 +41,7 @@ use std::{
     boxed::Box,
     cmp::max,
     collections::BTreeMap,
+    convert::TryInto,
     fs::{self, remove_file, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::FileExt,
@@ -52,6 +53,8 @@ use std::{
         Mutex,
     },
 };
+mod shuffle_manager;
+use shuffle_manager::ShuffleManager;
 
 lazy_static! {
     /// The tree-top caching threshold, specified as log2 of a number of bytes.
@@ -89,6 +92,9 @@ lazy_static! {
 
     /// Last valid snapshot on disk
     pub static ref LAST_ON_DISK_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(0u64);
+
+    /// Shuffle manager handler
+    pub static ref SHUFFLE_MANAGER_ID: AtomicU64 = AtomicU64::new(0u64);
 }
 
 //return (does snapshot become old, the newest value is on the left/right)
@@ -163,6 +169,8 @@ fn clear_all_sts(ptrs: &mut Vec<u8>, end_idx: usize) {
 struct UntrustedAllocation {
     /// The level of this ORAM
     level: u32,
+    /// The number of data and meta items in files
+    count: usize,
     /// The number of data and meta items stored in this allocation
     count_in_mem: usize,
     // The maximum count for the treetop storage in untrusted memory,
@@ -216,6 +224,7 @@ impl UntrustedAllocation {
     pub fn new(
         level: u32,
         snapshot_id: u64,
+        is_latest: bool,
         count: usize,
         data_item_size: usize,
         meta_item_size: usize,
@@ -224,7 +233,9 @@ impl UntrustedAllocation {
             2u64,
             (1u64 << TREETOP_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) / data_item_size as u64,
         );
-        let count_in_mem = if count <= treetop_max_count as usize {
+        let count_in_mem = if !is_latest && level == 0 {
+            0 //In this case, the structure is just used for management of buffers and files
+        } else if count <= treetop_max_count as usize {
             count
         } else {
             treetop_max_count as usize
@@ -267,7 +278,7 @@ impl UntrustedAllocation {
             .unwrap();
 
         let data_pointer = unsafe {
-            alloc(Layout::from_size_align(2 * count_in_mem * data_item_size, 8).unwrap())
+            alloc_zeroed(Layout::from_size_align(2 * count_in_mem * data_item_size, 8).unwrap())
         };
         if data_pointer.is_null() {
             panic!(
@@ -288,7 +299,8 @@ impl UntrustedAllocation {
         let ptrs_len = (count - 1) / 2 + 1;
         let mut ptrs = vec![0 as u8; ptrs_len];
 
-        if snapshot_id == 0 {
+        //for stale position ORAMs, just initialize them although the snapshot id is not 0
+        if snapshot_id == 0 || (!is_latest && level > 0) {
             let mut data_file_len = data_file.metadata().unwrap().len() as usize;
             let mut meta_file_len = meta_file.metadata().unwrap().len() as usize;
             let ptr_file_len = ptr_file.metadata().unwrap().len() as usize;
@@ -316,6 +328,7 @@ impl UntrustedAllocation {
                 core::slice::from_raw_parts_mut(meta_pointer, 2 * count_in_mem * meta_item_size)
             };
             //recovery
+            //For level==0 && !is_latest case, no data and meta is loaded
             data_file.read_exact_at(data, 0).unwrap();
             meta_file.read_exact_at(meta, 0).unwrap();
             ptr_file.read_exact_at(&mut ptrs, 0).unwrap();
@@ -326,6 +339,7 @@ impl UntrustedAllocation {
 
         Self {
             level,
+            count,
             count_in_mem,
             treetop_max_count,
             data_item_size,
@@ -368,6 +382,7 @@ impl Drop for UntrustedAllocation {
 pub extern "C" fn allocate_oram_storage(
     level: u32,
     snapshot_id: u64,
+    is_latest: u8,
     count: u64,
     data_size: u64,
     meta_size: u64,
@@ -376,7 +391,20 @@ pub extern "C" fn allocate_oram_storage(
     let mut m = LEVEL_TO_ORAM_INST.lock().unwrap();
     let id = m.entry(level).or_insert(0);
     println!("id = {:?}", id);
-    if *id == 0 {
+    if *id == 0 || (*id > 0 && is_latest == 0 && level > 0) {
+        //The read of stale data ORAM should not take this branch
+        if *id > 0 && is_latest == 0 {
+            let get_dropped =
+                unsafe { Box::<UntrustedAllocation>::from_raw(core::mem::transmute(*id)) };
+            assert!(
+                !get_dropped
+                    .critical_section_flag
+                    .swap(true, Ordering::SeqCst),
+                "Could not enter critical section when releasing storage"
+            );
+            #[cfg(debug_assertions)]
+            debug_checks::remove_id(*id);
+        }
         println!(
             "before allocing, level = {:?}, snapshot_id = {:?}",
             level, snapshot_id
@@ -384,6 +412,7 @@ pub extern "C" fn allocate_oram_storage(
         let result = Box::new(UntrustedAllocation::new(
             level,
             snapshot_id,
+            is_latest != 0,
             count as usize,
             data_size as usize,
             meta_size as usize,
@@ -394,6 +423,173 @@ pub extern "C" fn allocate_oram_storage(
     }
     unsafe {
         *id_out = *id;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn allocate_shuffle_manager(
+    allocation_id: u64,
+    z: u64,
+    bin_size_in_block: usize,
+    shuffle_id: *mut u64,
+) {
+    let storage =
+        unsafe { Box::<UntrustedAllocation>::from_raw(core::mem::transmute(allocation_id)) };
+    assert!(
+        !storage.critical_section_flag.swap(true, Ordering::SeqCst),
+        "Could not enter critical section when releasing storage"
+    );
+
+    let data_item_size = storage.data_item_size;
+    let meta_item_size = storage.meta_item_size;
+    let count_in_mem = storage.count_in_mem;
+
+    let buf_count = std::cmp::min(storage.count, storage.treetop_max_count as usize);
+    let num_bins = 2 * z as usize * storage.count / bin_size_in_block;
+    let mut dst_data_buf = vec![0; buf_count * data_item_size];
+    let mut dst_meta_buf = vec![0; buf_count * meta_item_size];
+    let dst_data_file_name = PathBuf::from("shuffle_data");
+    let dst_meta_file_name = PathBuf::from("shuffle_meta");
+    let mut dst_data_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .open(&dst_data_file_name)
+        .unwrap();
+    let mut dst_meta_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .open(&dst_meta_file_name)
+        .unwrap();
+
+    let src_data_buf = unsafe {
+        core::slice::from_raw_parts(storage.data_pointer, 2 * count_in_mem * data_item_size)
+    };
+    let src_meta_buf = unsafe {
+        core::slice::from_raw_parts(storage.meta_pointer, 2 * count_in_mem * meta_item_size)
+    };
+
+    for idx in 0..storage.count {
+        let p = get_sts_ptr(&storage.ptrs, idx).2;
+        if idx < buf_count && idx < count_in_mem {
+            (&mut dst_data_buf[data_item_size * idx..data_item_size * (idx + 1)]).copy_from_slice(
+                &src_data_buf[(2 * idx + p) * data_item_size..(2 * idx + p + 1) * data_item_size],
+            );
+        } else if idx < buf_count && idx >= count_in_mem {
+            storage
+                .data_file
+                .read_exact_at(
+                    &mut dst_data_buf[data_item_size * idx..data_item_size * (idx + 1)],
+                    (data_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
+                )
+                .unwrap();
+        } else if idx >= buf_count && idx < count_in_mem {
+            dst_data_file
+                .write_all(
+                    &src_data_buf
+                        [(2 * idx + p) * data_item_size..(2 * idx + p + 1) * data_item_size],
+                )
+                .unwrap();
+        } else {
+            let mut tmp_buf = vec![0; data_item_size];
+            storage
+                .data_file
+                .read_exact_at(
+                    &mut tmp_buf,
+                    (data_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
+                )
+                .unwrap();
+            dst_data_file.write_all(&tmp_buf).unwrap();
+        }
+    }
+    for idx in 0..storage.count {
+        let p = get_sts_ptr(&storage.ptrs, idx).2;
+        if idx < buf_count && idx < count_in_mem {
+            (&mut dst_meta_buf[meta_item_size * idx..meta_item_size * (idx + 1)]).copy_from_slice(
+                &src_meta_buf[(2 * idx + p) * meta_item_size..(2 * idx + p + 1) * meta_item_size],
+            );
+        } else if idx < buf_count && idx >= count_in_mem {
+            storage
+                .meta_file
+                .read_exact_at(
+                    &mut dst_meta_buf[meta_item_size * idx..meta_item_size * (idx + 1)],
+                    (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
+                )
+                .unwrap();
+        } else if idx >= buf_count && idx < count_in_mem {
+            dst_meta_file
+                .write_all(
+                    &src_meta_buf
+                        [(2 * idx + p) * meta_item_size..(2 * idx + p + 1) * meta_item_size],
+                )
+                .unwrap();
+        } else {
+            let mut tmp_buf = vec![0; meta_item_size];
+            storage
+                .meta_file
+                .read_exact_at(
+                    &mut tmp_buf,
+                    (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
+                )
+                .unwrap();
+            dst_meta_file.write_all(&tmp_buf).unwrap();
+        }
+    }
+
+    LEVEL_TO_ORAM_INST
+        .lock()
+        .unwrap()
+        .remove(&storage.level)
+        .unwrap();
+    drop(storage);
+    #[cfg(debug_assertions)]
+    debug_checks::remove_id(allocation_id);
+
+    let shuffle_manager = Box::new(ShuffleManager::new(
+        z,
+        buf_count,
+        data_item_size,
+        meta_item_size,
+        dst_data_buf,
+        dst_meta_buf,
+        dst_data_file,
+        dst_meta_file,
+        num_bins,
+    ));
+    let id = Box::into_raw(shuffle_manager) as u64;
+    SHUFFLE_MANAGER_ID.store(id, Ordering::SeqCst);
+    unsafe {
+        *shuffle_id = id;
+    }
+}
+
+/// # Safety
+///
+/// id must be a valid id previously returned by allocate_oram_storage
+pub unsafe fn release_oram_storage(id: u64) {
+    let ptr: *mut UntrustedAllocation = core::mem::transmute(id);
+    assert!(
+        !(*ptr).critical_section_flag.swap(true, Ordering::SeqCst),
+        "Could not enter critical section when releasing storage"
+    );
+    LEVEL_TO_ORAM_INST.lock().unwrap().remove(&(*ptr).level);
+    let _get_dropped = Box::<UntrustedAllocation>::from_raw(ptr);
+    #[cfg(debug_assertions)]
+    debug_checks::remove_id(id);
+}
+
+pub fn release_all_oram_storage() {
+    let ids = LEVEL_TO_ORAM_INST
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in ids {
+        unsafe {
+            release_oram_storage(id);
+        }
     }
 }
 
@@ -493,35 +689,6 @@ pub unsafe extern "C" fn persist_oram_storage(
         "Could not leave critical section when checking out storage"
     );
     println!("end persist_oram_storage");
-}
-
-/// # Safety
-///
-/// id must be a valid id previously returned by allocate_oram_storage
-pub unsafe fn release_oram_storage(id: u64) {
-    let ptr: *mut UntrustedAllocation = core::mem::transmute(id);
-    assert!(
-        !(*ptr).critical_section_flag.swap(true, Ordering::SeqCst),
-        "Could not enter critical section when releasing storage"
-    );
-    LEVEL_TO_ORAM_INST.lock().unwrap().remove(&(*ptr).level);
-    let _get_dropped = Box::<UntrustedAllocation>::from_raw(ptr);
-    #[cfg(debug_assertions)]
-    debug_checks::remove_id(id);
-}
-
-pub fn release_all_oram_storage() {
-    let ids = LEVEL_TO_ORAM_INST
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for id in ids {
-        unsafe {
-            release_oram_storage(id);
-        }
-    }
 }
 
 /// # Safety
@@ -740,7 +907,11 @@ pub unsafe extern "C" fn checkin_oram_storage(
 }
 
 #[no_mangle]
-pub extern "C" fn get_valid_snapshot_id(size_triv_pos_map: u64, snapshot_id: *mut u64) {
+pub extern "C" fn get_valid_snapshot_id(
+    size_triv_pos_map: u64,
+    snapshot_id: *mut u64,
+    lifetime_id_from_meta: *mut u64,
+) {
     let mut snapshot_to_tposmap = SNAPSHOT_TO_TPOSMAP.lock().unwrap();
 
     let mut id_to_len = BTreeMap::new();
@@ -794,9 +965,15 @@ pub extern "C" fn get_valid_snapshot_id(size_triv_pos_map: u64, snapshot_id: *mu
 
         if id_mem != 0 && id_mem >= id_disk {
             if tposmap_len_mem == size_triv_pos_map {
-                unsafe { *snapshot_id = id_mem };
-                println!("id_mem = {:?}", id_mem);
                 not_found = false;
+                let tposmap = snapshot_to_tposmap.get(&id_mem).unwrap();
+                //Notice: should be consistent with enclave/src/oram_manager/position_map
+                let lifetime_id_buf: [u8; 8] = (&tposmap[48..56]).try_into().unwrap();
+                println!("id_mem = {:?}", id_mem);
+                unsafe {
+                    *snapshot_id = id_mem;
+                    *lifetime_id_from_meta = u64::from_le_bytes(lifetime_id_buf);
+                }
             } else {
                 snapshot_to_tposmap.remove(&id_mem);
                 SNAPSHOT_TO_STASH.lock().unwrap().remove(&id_mem);
@@ -805,9 +982,21 @@ pub extern "C" fn get_valid_snapshot_id(size_triv_pos_map: u64, snapshot_id: *mu
             }
         } else if id_disk != 0 {
             if tposmap_len_disk == size_triv_pos_map {
-                unsafe { *snapshot_id = id_disk };
-                println!("id_disk = {:?}", id_disk);
                 not_found = false;
+                let mut tposmap = Vec::new();
+                if let Ok(mut f) = File::open(&PathBuf::from(
+                    "trivial_posmap_".to_string() + &id_disk.to_string(),
+                )) {
+                    f.read_to_end(&mut tposmap).unwrap();
+                };
+                //Notice: should be consistent with enclave/src/oram_manager/position_map
+                let lifetime_id_buf: [u8; 8] = (&tposmap[48..56]).try_into().unwrap();
+                println!("id_disk = {:?}", id_disk);
+                unsafe {
+                    *snapshot_id = id_disk;
+                    *lifetime_id_from_meta = u64::from_le_bytes(lifetime_id_buf);
+                }
+                //remove other files
                 id_to_files.remove(&id_disk);
                 for (_, files) in id_to_files.iter() {
                     for file in files {
