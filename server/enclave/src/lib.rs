@@ -97,7 +97,11 @@ type StorageBlockMetaSize = U24;
 type StorageBucketSize = U4096;
 type StorageBucketMetaSize = U96; //MetaSize(24)*Z(4)
 type StorageZ = U4;
-const STASH_SIZE: usize = 16;
+//according to the Table 3 in the Path ORAM paper, the maximum stash size required such that the probability of
+//exceeding the stash size is less than 2^-80 for a worst-case (in terms of stash size) access pattern with Z=4
+//89. The probability setting is the same for the overflow probability in bucket oblivious sort
+//(set in shuffle_manager.rs). The stash size does not include the temporarily fetched path during Access.
+const STASH_SIZE: usize = 89;
 /// Bucket size = U4096, Z = U4, MetaSize = U96
 type ORAMCreatorClass = PathORAM4096Z4Creator<RngType, OcallORAMStorageCreator>;
 type ORAMClass = PathORAM<

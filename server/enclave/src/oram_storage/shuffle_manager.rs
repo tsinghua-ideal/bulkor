@@ -17,7 +17,7 @@ use std::ops::{Add, Deref, Div};
 use std::vec::Vec;
 
 //The parameter in bucket oblivious sort
-//For an overflow probability of 2^80 and most reasonable values of n, Z = 512 suffices.
+//For an overflow probability of 2^-80 and most reasonable values of n, Z = 512 suffices.
 pub const BIN_SIZE_IN_BLOCK: usize = 512;
 //assume dummy element random_key=0 or u64::MAX
 const DUMMY_KEY_LEFT: u64 = 0;
