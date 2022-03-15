@@ -192,6 +192,11 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
             )
         }
     }
+
+    fn get_shuffle_pos(&self, key: &u64) -> (u64, Choice) {
+        //since the treetop is always accessed through the outer storage
+        unreachable!()
+    }
 }
 
 /// HeapORAMStorage simply allocates a vector, and requires no special

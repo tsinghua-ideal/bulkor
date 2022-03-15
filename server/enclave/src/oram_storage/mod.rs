@@ -39,7 +39,7 @@ use std::vec::Vec;
 use aes::cipher::{NewCipher, StreamCipher};
 use aes_gcm::aead::{Aead, NewAead};
 use aligned_cmov::{
-    subtle::ConstantTimeEq,
+    subtle::{Choice, ConstantTimeEq},
     typenum::{PartialDiv, PowerOfTwo, Quot, Sum, Unsigned, U8},
     A64Bytes, A8Bytes, ArrayLength, GenericArray,
 };
@@ -206,6 +206,8 @@ where
     // The key we use when hashing ciphertexts to make merkle tree
     // Keeping this secret makes the hash functionally a mac
     hash_key: GenericArray<u8, KeySize>,
+    // shuffle_nonce
+    shuffle_nonce: GenericArray<u8, NonceSize>,
     _z: PhantomData<fn() -> Z>,
 }
 
@@ -278,6 +280,8 @@ where
         };
         //recovery is included in allocation
         let mut allocation_id = 0u64;
+        //generate a random number for nonce of permutation, and it needs to be persisted
+        let mut shuffle_nonce = GenericArray::<u8, NonceSize>::default();
         unsafe {
             allocate_oram_storage(
                 level,
@@ -287,6 +291,8 @@ where
                 DataSize::U64,
                 MetaSize::U64 + ExtraMetaSize::U64,
                 &mut allocation_id,
+                shuffle_nonce.as_mut_ptr(),
+                NonceSize::U64,
             );
         }
         if allocation_id == 0 {
@@ -310,15 +316,17 @@ where
             unsafe {
                 allocate_shuffle_manager(allocation_id, Z::U64, BIN_SIZE_IN_BLOCK, &mut shuffle_id);
             }
+            //change the shuffle nonce
             manage(
                 shuffle_id,
-                &mut allocation_id,
+                allocation_id,
                 count,
                 treetop_max_count as usize,
                 &mut treetop,
                 &mut trusted_merkle_roots,
                 &aes_key,
                 &hash_key,
+                &mut shuffle_nonce,
                 rng,
             );
         }
@@ -335,6 +343,7 @@ where
             meta_scratch_buffer: Default::default(),
             aes_key,
             hash_key,
+            shuffle_nonce,
             _z: Default::default(),
         }
     }
@@ -629,6 +638,20 @@ where
             )
         }
     }
+
+    fn get_shuffle_pos(&self, key: &u64) -> (u64, Choice) {
+        let mut new_leaf_buf = key.to_le_bytes();
+        let mut cipher = CipherType::new(&self.aes_key, &self.shuffle_nonce);
+        cipher.apply_keystream(&mut new_leaf_buf);
+        let new_leaf =
+            (u64::from_le_bytes(new_leaf_buf) & ((self.count >> 1) - 1)) + (self.count >> 1);
+        (
+            new_leaf,
+            !self
+                .shuffle_nonce
+                .ct_eq(&GenericArray::<u8, NonceSize>::default()),
+        )
+    }
 }
 
 /// An ORAMStorageCreator for the Ocall-based storage type
@@ -715,10 +738,57 @@ mod helpers {
             )
         }
     }
+
+    //for debug use
+    pub fn pull_all_elements_ocall<
+        DataSize: ArrayLength<u8> + PartialDiv<U8>,
+        MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+    >(
+        allocation_id: u64,
+        count: u64,
+        aes_key: &GenericArray<u8, KeySize>,
+    ) {
+        {
+            let mut data: Vec<GenericArray<u8, DataSize>> =
+                vec![Default::default(); count as usize];
+            let mut meta: Vec<GenericArray<u8, MetaSize>> =
+                vec![Default::default(); count as usize];
+            unsafe {
+                pull_all_elements(
+                    allocation_id,
+                    data.as_mut_ptr() as *mut u8,
+                    data.len() * DataSize::USIZE,
+                    meta.as_mut_ptr() as *mut u8,
+                    meta.len() * (MetaSize::USIZE + ExtraMetaSize::USIZE),
+                );
+            }
+            let mut filtered = vec![];
+            for idx in 0..count as usize {
+                if meta[idx] == Default::default() {
+                    continue;
+                }
+                let (meta_mut, extra_meta_mut) = meta[idx].split_at_mut(MetaSize::USIZE);
+                let extra_meta = ExtraMeta::from(&*extra_meta_mut);
+                let aes_nonce = make_aes_nonce(idx as u64, extra_meta.block_ctr);
+                let mut cipher = CipherType::new(aes_key, &aes_nonce);
+                cipher.apply_keystream(&mut data[idx]);
+                cipher.apply_keystream(meta_mut);
+                filtered.push((idx, data[idx].clone(), meta[idx].clone()));
+            }
+            println!("filtered = {:?}", filtered);
+        }
+    }
 }
 
 // This stuff must match edl file
 extern "C" {
+    fn pull_all_elements(
+        id: u64,
+        databuf: *mut u8,
+        databuf_size: usize,
+        metabuf: *mut u8,
+        metabuf_size: usize,
+    );
     fn allocate_oram_storage(
         level: u32,
         snapshot_id: u64,
@@ -727,6 +797,8 @@ extern "C" {
         data_size: u64,
         meta_size: u64,
         id: *mut u64,
+        shuffle_nonce: *mut u8,
+        shuffle_nonce_size: u64,
     );
     fn allocate_shuffle_manager(
         allocation_id: u64,

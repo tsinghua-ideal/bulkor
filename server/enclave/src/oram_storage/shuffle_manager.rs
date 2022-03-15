@@ -11,13 +11,14 @@ use aligned_cmov::{
 use blake2::{digest::Digest, Blake2b};
 use rand_core::{CryptoRng, RngCore};
 use sgx_trts::trts::rsgx_read_rand;
+use std::boxed::Box;
 use std::convert::TryInto;
 use std::ops::{Add, Deref, Div};
 use std::vec::Vec;
 
 //The parameter in bucket oblivious sort
 //For an overflow probability of 2^80 and most reasonable values of n, Z = 512 suffices.
-pub const BIN_SIZE_IN_BLOCK: usize = 1024;
+pub const BIN_SIZE_IN_BLOCK: usize = 512;
 //assume dummy element random_key=0 or u64::MAX
 const DUMMY_KEY_LEFT: u64 = 0;
 const DUMMY_KEY_RIGHT: u64 = u64::MAX;
@@ -128,15 +129,16 @@ fn reformat_metadata<MetaSize, Z>(
             let mut cipher = CipherType::new(aes_key, shuffle_nonce);
             cipher.apply_keystream(&mut new_leaf_buf);
             let mut new_leaf =
-                (u64::from_ne_bytes(new_leaf_buf) & ((count >> 1) - 1)) + (count >> 1);
+                (u64::from_le_bytes(new_leaf_buf) & ((count >> 1) - 1)) + (count >> 1);
             new_leaf.cmov(is_vacant, &0);
+            new_leaf_buf = new_leaf.to_le_bytes();
             (&mut meta_item[0..8]).copy_from_slice(&new_leaf_buf);
             //assign old block idx
             let old_idx = (b_idx + i) * Z::USIZE + idx_in_block;
-            (&mut meta_item[8..16]).copy_from_slice(&old_idx.to_ne_bytes());
+            (&mut meta_item[8..16]).copy_from_slice(&old_idx.to_le_bytes());
             //assign new bucket idx
             let new_idx = new_leaf;
-            (&mut meta_item[16..24]).copy_from_slice(&new_idx.to_ne_bytes());
+            (&mut meta_item[16..24]).copy_from_slice(&new_idx.to_le_bytes());
         }
     }
 }
@@ -177,45 +179,14 @@ where
         hasher.update(item.as_ref().deref());
     }
     for item in random_keys {
-        let mut item_buf = item.to_ne_bytes();
+        let mut item_buf = item.to_le_bytes();
         cipher.apply_keystream(&mut item_buf);
         hasher.update(item_buf);
-        *item = u64::from_ne_bytes(item_buf);
+        *item = u64::from_le_bytes(item_buf);
     }
     let result = hasher.finalize();
     (nonce, result[..16].try_into().unwrap())
 }
-
-// fn encrypt_and_authenticate_bin<
-//     Rng: RngCore + CryptoRng,
-//     N: ArrayLength<u8> + PartialDiv<U8>,
-//     T: AsAlignedChunks<A8, N>,
-// >(
-//     aes_key: &GenericArray<u8, KeySize>,
-//     hash_key: &GenericArray<u8, KeySize>,
-//     pt: &mut Vec<T>,
-//     cur_bin_num: usize,
-//     freshness_nonce: &GenericArray<u8, NonceSize>,
-//     rng: &mut Rng,
-// ) -> (GenericArray<u8, NonceSize>, Hash) {
-//     let mut nonce = GenericArray::<u8, NonceSize>::default();
-//     rng.fill_bytes(nonce.as_mut_slice());
-//     let mut cipher = CipherType::new(aes_key, &nonce);
-//     let mut hasher = Blake2b::new();
-//     hasher.update(hash_key);
-//     hasher.update(&nonce);
-//     hasher.update(freshness_nonce);
-//     hasher.update(cur_bin_num.to_le_bytes());
-//     for item in pt.iter_mut() {
-//         let tmp_items: &mut [A8Bytes<N>] = item.as_mut_aligned_chunks();
-//         for tmp_item in tmp_items {
-//             cipher.apply_keystream(&mut tmp_item);
-//             hasher.update(tmp_item.as_ref().deref());
-//         }
-//     }
-//     let result = hasher.finalize();
-//     (nonce, result[..16].try_into().unwrap())
-// }
 
 //this interface supports separate keys for aes and hash
 //this function is called when pulling bins
@@ -249,10 +220,10 @@ fn decrypt_and_verify_bin<DataSize, MetaSize>(
         cipher.apply_keystream(item);
     }
     for item in random_keys {
-        let mut item_buf = item.to_ne_bytes();
+        let mut item_buf = item.to_le_bytes();
         hasher.update(item_buf);
         cipher.apply_keystream(&mut item_buf);
-        *item = u64::from_ne_bytes(item_buf);
+        *item = u64::from_le_bytes(item_buf);
     }
     let loaded_hash: Hash = hasher.finalize()[..16].try_into().unwrap();
     assert_eq!(&loaded_hash, hash);
@@ -276,8 +247,8 @@ fn push_bin<Rng, DataSize, MetaSize>(
     MetaSize: ArrayLength<u8> + PartialDiv<U8>,
 {
     let (nonce, hash) = encrypt_and_authenticate_bin(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         data,
         meta,
         random_keys,
@@ -328,12 +299,15 @@ fn pull_bin<DataSize, MetaSize>(
         &mut nonce,
         &mut hash,
     );
+    let has_data = (data.len() > 0) as usize;
+    let has_meta = (meta.len() > 0) as usize;
+    let has_random_keys = (random_keys.len() > 0) as usize;
     decrypt_and_verify_bin(
-        &aes_key,
-        &hash_key,
-        data,
-        meta,
-        random_keys,
+        aes_key,
+        hash_key,
+        &mut data[..*bin_size * has_data],
+        &mut meta[..*bin_size * has_meta],
+        &mut random_keys[..*bin_size * has_random_keys],
         cur_bin_num,
         &freshness_nonce,
         &nonce,
@@ -343,13 +317,14 @@ fn pull_bin<DataSize, MetaSize>(
 
 pub fn manage<DataSize, MetaSize, Z, Rng>(
     shuffle_id: u64,
-    allocation_id: &mut u64,
+    allocation_id: u64,
     count: u64,
     treetop_max_count: usize,
     treetop: &mut HeapORAMStorage<DataSize, MetaSize, Z>,
     trusted_merkle_roots: &mut Vec<Hash>,
     aes_key: &GenericArray<u8, KeySize>,
     hash_key: &GenericArray<u8, KeySize>,
+    shuffle_nonce: &mut GenericArray<u8, NonceSize>,
     rng: &mut Rng,
 ) where
     DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z>,
@@ -360,8 +335,6 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
     Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
-    //generate a random number for nonce of permutation, and it needs to be persisted
-    let mut shuffle_nonce = GenericArray::<u8, NonceSize>::default();
     //seal nonce is needed to store original data and metadata
     let mut seal_nonce = GenericArray::<u8, NonceSize>::default();
     //freshness nonce should change every time a round in bucket oblivious sort is finished
@@ -369,10 +342,10 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     //freshness nonce used for aes gcm
     let mut freshness_auth_nonce = GenericArray::<u8, AuthNonceSize>::default();
 
-    rsgx_read_rand(&mut shuffle_nonce);
-    rsgx_read_rand(&mut seal_nonce);
-    rsgx_read_rand(&mut freshness_nonce);
-    rsgx_read_rand(&mut freshness_auth_nonce);
+    rsgx_read_rand(shuffle_nonce).unwrap();
+    rsgx_read_rand(&mut seal_nonce).unwrap();
+    rsgx_read_rand(&mut freshness_nonce).unwrap();
+    rsgx_read_rand(&mut freshness_auth_nonce).unwrap();
 
     //read and verify buckets and extract info from metadata
     //specifically, (old leaf num, block num, counter), we use bin
@@ -385,6 +358,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         num_bins & (num_bins - 1) == 0,
         "num_bins must be a power of two"
     );
+    println!("begin pull all oram buckets");
     //reorganize buckets and prepare bins for subsequent shuffle
     {
         //reassign bin_size_in_bucket because we don't pad now
@@ -393,12 +367,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         let mut e_count = count as usize;
         let mut b_count = e_count >> 1;
 
-        ALLOCATOR.set_switch(true);
-        let mut hashes = vec![Default::default(); b_count];
-        let mut prev_hashes: Vec<Hash> = Vec::new();
-        ALLOCATOR.set_switch(false);
-        let mut hash_hashes = vec![Default::default(); b_count / bin_size_in_bucket];
-        let mut prev_hash_hashes: Vec<Hash> = Vec::new();
+        let mut prev_tier_hash: Hash = Default::default();
 
         while b_count > 0 {
             let mut e_idx = e_count;
@@ -423,17 +392,16 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                         &mut meta_plus_extra[bin_size_in_bucket - delta..],
                     );
                     while b_count >= treetop_max_count {
-                        let mut prev_hasher = Blake2b::new();
-                        prev_hasher.update(&hash_key);
-                        prev_hasher.update(1u64.to_le_bytes());
-                        for i in b_count..e_count {
+                        let mut prev_tier_hasher = Blake2b::new();
+                        prev_tier_hasher.update(hash_key);
+                        for i in (b_count..e_count).rev() {
                             if meta_plus_extra[i] != Default::default() {
                                 let idx = b_idx + i;
                                 let (this_block_hash, extra_meta) = decrypt_bucket_and_pre_verify(
                                     idx,
                                     i,
-                                    &aes_key,
-                                    &hash_key,
+                                    aes_key,
+                                    hash_key,
                                     &mut data,
                                     &mut meta,
                                     &mut meta_plus_extra,
@@ -442,18 +410,13 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                                 );
                                 // If this block has a child, check if its hash that we computed before matches
                                 // metadata. And we should verify the prev_hashes before assertion.
-                                if is_bottom_in_bucket && b_count < count as usize >> 1 {
-                                    let left_child_hash = prev_hashes[(idx << 1) - e_count];
-                                    let right_child_hash = prev_hashes[(idx << 1) + 1 - e_count];
-                                    let default: [u8; 16] = Default::default();
-                                    if left_child_hash != default {
-                                        prev_hasher.update(&left_child_hash);
+                                if is_bottom_in_bucket && e_count < count as usize {
+                                    if extra_meta.right_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(&extra_meta.right_child_hash);
                                     }
-                                    if right_child_hash != default {
-                                        prev_hasher.update(&right_child_hash);
+                                    if extra_meta.left_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(&extra_meta.left_child_hash);
                                     }
-                                    assert_eq!(left_child_hash, extra_meta.left_child_hash);
-                                    assert_eq!(right_child_hash, extra_meta.right_child_hash);
                                 }
                                 // No need to authenticate the block hash, no need for additionally storing hashes anymore
                                 // we can just check against already-fetched metadata of parents
@@ -477,11 +440,9 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                             }
                         }
                         //if the current tier is not the lowest tier but is the lowest tier in the bucket
-                        if is_bottom_in_bucket && b_count < count as usize >> 1 {
-                            let res: [u8; 16] = prev_hasher.finalize()[..16].try_into().unwrap();
-                            assert!(hash_hashes.is_empty());
-                            assert_eq!(prev_hash_hashes.len(), 1);
-                            assert_eq!(prev_hash_hashes[0], res);
+                        if is_bottom_in_bucket && e_count < count as usize {
+                            let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
+                            assert_eq!(prev_tier_hash, h);
                         }
 
                         is_bottom_in_bucket = false;
@@ -499,8 +460,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 let mut original_meta = meta.clone();
 
                 push_bin::<_, DataSize, MetaSize>(
-                    &aes_key,
-                    &hash_key,
+                    aes_key,
+                    hash_key,
                     &seal_nonce,
                     shuffle_id,
                     cur_bin_num,
@@ -511,8 +472,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     rng,
                 );
                 push_bin::<_, DataSize, MetaSize>(
-                    &aes_key,
-                    &hash_key,
+                    aes_key,
+                    hash_key,
                     &seal_nonce,
                     shuffle_id,
                     cur_bin_num,
@@ -524,10 +485,10 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 );
 
                 //compute new idx from block num
-                reformat_metadata(&aes_key, &shuffle_nonce, count, b_idx, &mut meta);
+                reformat_metadata(aes_key, shuffle_nonce, count, b_idx, &mut meta);
                 push_bin::<_, DataSize, MetaSize>(
-                    &aes_key,
-                    &hash_key,
+                    aes_key,
+                    hash_key,
                     &freshness_nonce,
                     shuffle_id,
                     cur_bin_num,
@@ -540,6 +501,10 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
 
                 b_count = 0;
             } else {
+                let mut cur_tier_hasher = Blake2b::new();
+                let mut prev_tier_hasher = Blake2b::new();
+                cur_tier_hasher.update(hash_key);
+                prev_tier_hasher.update(hash_key);
                 while e_idx > b_count {
                     let mut data: Vec<A64Bytes<DataSize>> =
                         vec![Default::default(); bin_size_in_bucket];
@@ -560,86 +525,56 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                             &mut meta_plus_extra[delta..],
                         );
                         //decrypt data and meta, and verify
-                        let mut cur_hasher = Blake2b::new();
-                        let mut prev_hasher = vec![Blake2b::new(), Blake2b::new()];
-                        cur_hasher.update(&hash_key);
-                        cur_hasher.update(cur_bin_num.to_le_bytes());
-                        prev_hasher[0].update(&hash_key);
-                        prev_hasher[1].update(&hash_key);
-                        prev_hasher[0].update((cur_bin_num << 1).to_le_bytes());
-                        prev_hasher[1].update(((cur_bin_num << 1) + 1).to_le_bytes());
-                        for i in delta..bin_size_in_bucket {
+                        for i in (delta..bin_size_in_bucket).rev() {
                             if meta_plus_extra[i] != Default::default() {
                                 let idx = b_idx + i; //bucket idx
                                 let (this_block_hash, extra_meta) = decrypt_bucket_and_pre_verify(
                                     idx,
                                     i,
-                                    &aes_key,
-                                    &hash_key,
+                                    aes_key,
+                                    hash_key,
                                     &mut data,
                                     &mut meta,
                                     &mut meta_plus_extra,
                                     treetop_max_count,
-                                    &trusted_merkle_roots,
+                                    trusted_merkle_roots,
                                 );
                                 // If this block has a child, check if its hash that we computed before matches
-                                // metadata. And we should verify the prev_hashes before assertion.
-                                if b_count < count as usize >> 1 {
-                                    let left_child_hash = prev_hashes[(idx << 1) - e_count];
-                                    let right_child_hash = prev_hashes[(idx << 1) + 1 - e_count];
-                                    let default: [u8; 16] = Default::default();
-                                    if left_child_hash != default {
-                                        prev_hasher[(i >= bin_size_in_bucket / 2) as usize]
-                                            .update(&left_child_hash);
+                                // metadata.
+
+                                if e_count < count as usize {
+                                    if extra_meta.right_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(&extra_meta.right_child_hash);
                                     }
-                                    if right_child_hash != default {
-                                        prev_hasher[(i >= bin_size_in_bucket / 2) as usize]
-                                            .update(&right_child_hash);
+                                    if extra_meta.left_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(&extra_meta.left_child_hash);
                                     }
-                                    assert_eq!(left_child_hash, extra_meta.left_child_hash);
-                                    assert_eq!(right_child_hash, extra_meta.right_child_hash);
                                 }
                                 //authenticate the hashes because the hashes are stored in untrusted domain
-                                if b_idx >= 2 * treetop_max_count {
-                                    cur_hasher.update(&this_block_hash);
-                                    hashes[idx - b_count] = this_block_hash;
+                                if b_idx >= 2 * treetop_max_count
+                                    && this_block_hash != Hash::default()
+                                {
+                                    cur_tier_hasher.update(&this_block_hash);
                                 }
                             }
-                        }
-                        if b_idx >= 2 * treetop_max_count {
-                            hash_hashes[cur_bin_num - b_count / bin_size_in_bucket] =
-                                cur_hasher.finalize()[..16].try_into().unwrap();
-                        }
-                        //if the current tier is not the lowest tier
-                        if b_count < count as usize >> 1 {
-                            let res_0: [u8; 16] =
-                                prev_hasher.remove(0).finalize()[..16].try_into().unwrap();
-                            let res_1: [u8; 16] =
-                                prev_hasher.remove(0).finalize()[..16].try_into().unwrap();
-                            assert_eq!(
-                                prev_hash_hashes[(cur_bin_num << 1) - e_count / bin_size_in_bucket],
-                                res_0
-                            );
-                            assert_eq!(
-                                prev_hash_hashes
-                                    [(cur_bin_num << 1) + 1 - e_count / bin_size_in_bucket],
-                                res_1
-                            );
                         }
                     }
                     //copy from treetop to the buffers above
                     //copy is necessary because the original meta should be kept
                     //no need to decrypt and verify
-                    (&mut data[..delta]).clone_from_slice(&treetop.data[b_idx..b_idx + delta]);
-                    (&mut meta[..delta]).clone_from_slice(&treetop.metadata[b_idx..b_idx + delta]);
+                    if b_idx < treetop_max_count {
+                        (&mut data[..delta]).clone_from_slice(&treetop.data[b_idx..b_idx + delta]);
+                        (&mut meta[..delta])
+                            .clone_from_slice(&treetop.metadata[b_idx..b_idx + delta]);
+                    }
 
                     //write data and meta back separately with encryption and authentication
                     //in the untrusted domain, data may saved on disk, while meta almost in memory for further process
                     let mut original_meta = meta.clone();
 
                     push_bin::<_, DataSize, MetaSize>(
-                        &aes_key,
-                        &hash_key,
+                        aes_key,
+                        hash_key,
                         &seal_nonce,
                         shuffle_id,
                         cur_bin_num,
@@ -650,8 +585,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                         rng,
                     );
                     push_bin::<_, DataSize, MetaSize>(
-                        &aes_key,
-                        &hash_key,
+                        aes_key,
+                        hash_key,
                         &seal_nonce,
                         shuffle_id,
                         cur_bin_num,
@@ -663,12 +598,12 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     );
 
                     //compute new idx from block num
-                    reformat_metadata(&aes_key, &shuffle_nonce, count, b_idx, &mut meta);
+                    reformat_metadata(aes_key, shuffle_nonce, count, b_idx, &mut meta);
                     //although the DataSize, MetaSize is not consistent with subsequent
                     //pull_bin and push_bin in bucket oblivious sort, it does not matter
                     push_bin::<_, DataSize, MetaSize>(
-                        &aes_key,
-                        &hash_key,
+                        aes_key,
+                        hash_key,
                         &freshness_nonce,
                         shuffle_id,
                         cur_bin_num,
@@ -682,26 +617,21 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     cur_bin_num -= 1;
                     e_idx = b_idx;
                 }
+                if e_count < count as usize {
+                    let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
+                    assert_eq!(prev_tier_hash, h);
+                }
+                prev_tier_hash = cur_tier_hasher.finalize()[..16].try_into().unwrap();
                 e_count = b_count;
                 b_count >>= 1;
-                ALLOCATOR.set_switch(true);
-                drop(prev_hashes);
-                prev_hashes = hashes;
-                hashes = vec![Default::default(); b_count];
-                ALLOCATOR.set_switch(false);
-                prev_hash_hashes = hash_hashes;
-                hash_hashes = vec![Default::default(); b_count / bin_size_in_bucket];
             }
         }
-        ALLOCATOR.set_switch(true);
-        drop(hashes);
-        drop(prev_hashes);
-        ALLOCATOR.set_switch(false);
 
         unsafe {
-            bin_switch(0, num_bins);
+            bin_switch(shuffle_id, 0, num_bins);
         }
     }
+    println!("finish pull all oram buckets");
 
     //whether there is a modification to new idx
     //if so, do bucket oblivious sort (new leaf num, old idx, new idx) by new idx
@@ -713,8 +643,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     //The first num_bins / 2 bins
     while cur_num_bins >= 2 {
         bucket_oblivious_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             cur_num_bins,
@@ -729,8 +659,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         }
         //if a bucket holds blocks more than its capacity, move excess blocks from leaf to root
         oblivious_push_location_upwards::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             cur_num_bins,
@@ -741,8 +671,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     //change the new idx in bucket to new idx in block
     //TODO: if freshness nonce is changed per round, check it
     oblivious_idx_transformation::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
@@ -751,8 +681,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
 
     //oblivious placement according to new idx, and assign idx of vacant place to dummy blocks
     oblivious_placement::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
@@ -761,8 +691,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
 
     //bucket oblivious sort info by old idx
     bucket_oblivious_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
@@ -774,8 +704,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
 
     //patch the sorted info to original blocks
     patch_meta::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &seal_nonce,
         &freshness_nonce,
         shuffle_id,
@@ -787,9 +717,10 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     //TODO: maybe both seal_nonce and freshness nonce are needed
     //because loading the seperate data and meta bins needs seal_nonce
     //while loading the intermediate bins needs freshness_nonce
+    println!("start bucket oblivious sort data and meta");
     bucket_oblivious_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &seal_nonce,
         shuffle_id,
         num_bins,
@@ -798,6 +729,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         true,
         rng,
     );
+    println!("finish bucket oblivious sort data and meta");
 
     //authenticate blocks as in oram tree. During the procedure,
     //clear the new idx, that is, restore the function of counter and reset it to 0
@@ -812,8 +744,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         let mut hashes = vec![Default::default(); b_count];
         let mut prev_hashes: Vec<Hash> = Vec::new();
         ALLOCATOR.set_switch(false);
-        let mut hash_hashes = vec![Default::default(); b_count / bin_size_in_bucket];
-        let mut prev_hash_hashes: Vec<Hash> = Vec::new();
+
+        let mut prev_tier_hash: Hash = Default::default();
 
         while b_count > 0 {
             let mut e_idx = e_count;
@@ -824,8 +756,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 let mut data = vec![Default::default(); bin_size_in_bucket];
                 let mut meta = vec![Default::default(); bin_size_in_bucket];
                 pull_bin::<DataSize, MetaSize>(
-                    &aes_key,
-                    &hash_key,
+                    aes_key,
+                    hash_key,
                     &seal_nonce,
                     shuffle_id,
                     cur_bin_num,
@@ -851,10 +783,9 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     let mut is_bottom_in_bucket = true;
                     while b_count >= treetop_max_count {
                         //encrypt data and meta, and authenticate
-                        let mut prev_hasher = Blake2b::new();
-                        prev_hasher.update(&hash_key);
-                        prev_hasher.update(1u64.to_le_bytes());
-                        for i in b_count..e_count {
+                        let mut prev_tier_hasher = Blake2b::new();
+                        prev_tier_hasher.update(hash_key);
+                        for i in (b_count..e_count).rev() {
                             let idx = b_idx + i;
 
                             // Update the metadata field and extract the new block_ctr value so that we can encrypt
@@ -874,11 +805,15 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                                 // If this block has a child, update extra_meta
                                 // If this block has a child, check if its hash that we computed before matches
                                 // metadata. And we should verify the prev_hashes before assertion.
-                                if is_bottom_in_bucket && b_count < count as usize >> 1 {
+                                if is_bottom_in_bucket && e_count < count as usize {
                                     let left_child_hash = prev_hashes[(idx << 1) - e_count];
                                     let right_child_hash = prev_hashes[(idx << 1) + 1 - e_count];
-                                    prev_hasher.update(&left_child_hash);
-                                    prev_hasher.update(&right_child_hash);
+                                    if right_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(right_child_hash);
+                                    }
+                                    if left_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(left_child_hash);
+                                    }
                                     extra_meta_val.left_child_hash = left_child_hash;
                                     extra_meta_val.right_child_hash = right_child_hash;
                                 }
@@ -899,8 +834,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                             let this_block_hash = encrypt_bucket_and_pre_authenticate::<_, MetaSize>(
                                 idx,
                                 i,
-                                &aes_key,
-                                &hash_key,
+                                aes_key,
+                                hash_key,
                                 &mut data,
                                 block_ctr,
                                 &mut meta_plus_extra,
@@ -922,11 +857,9 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                             }
                         }
                         //if the current tier is not the lowest tier but is the lowest tier in the bucket
-                        if is_bottom_in_bucket && b_count < count as usize >> 1 {
-                            let res: [u8; 16] = prev_hasher.finalize()[..16].try_into().unwrap();
-                            assert!(hash_hashes.is_empty());
-                            assert_eq!(prev_hash_hashes.len(), 1);
-                            assert_eq!(prev_hash_hashes[0], res);
+                        if is_bottom_in_bucket && e_count < count as usize {
+                            let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
+                            assert_eq!(prev_tier_hash, h);
                         }
 
                         is_bottom_in_bucket = false;
@@ -950,13 +883,17 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
 
                 b_count = 0;
             } else {
+                let mut cur_tier_hasher = Blake2b::new();
+                let mut prev_tier_hasher = Blake2b::new();
+                cur_tier_hasher.update(hash_key);
+                prev_tier_hasher.update(hash_key);
                 while e_idx > b_count {
                     let mut actual_bin_size = 0;
                     let mut data = vec![Default::default(); bin_size_in_bucket];
                     let mut meta = vec![Default::default(); bin_size_in_bucket];
                     pull_bin::<DataSize, MetaSize>(
-                        &aes_key,
-                        &hash_key,
+                        aes_key,
+                        hash_key,
                         &seal_nonce,
                         shuffle_id,
                         cur_bin_num,
@@ -983,15 +920,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                         delta = treetop_max_count.saturating_sub(b_idx);
                         assert_eq!(delta, 0);
                         //encrypt data and meta, and authenticate
-                        let mut cur_hasher = Blake2b::new();
-                        let mut prev_hasher = vec![Blake2b::new(), Blake2b::new()];
-                        cur_hasher.update(&hash_key);
-                        cur_hasher.update(cur_bin_num.to_le_bytes());
-                        prev_hasher[0].update(&hash_key);
-                        prev_hasher[1].update(&hash_key);
-                        prev_hasher[0].update((cur_bin_num << 1).to_le_bytes());
-                        prev_hasher[1].update(((cur_bin_num << 1) + 1).to_le_bytes());
-                        for i in delta..bin_size_in_bucket {
+                        for i in (delta..bin_size_in_bucket).rev() {
                             let idx = b_idx + i; //bucket_idx
 
                             // Update the metadata field and extract the new block_ctr value so that we can encrypt
@@ -1011,13 +940,15 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                                 // If this block has a child, update extra_meta
                                 // If this block has a child, check if its hash that we computed before matches
                                 // metadata. And we should verify the prev_hashes before assertion.
-                                if b_count < count as usize >> 1 {
+                                if e_count < count as usize {
                                     let left_child_hash = prev_hashes[(idx << 1) - e_count];
                                     let right_child_hash = prev_hashes[(idx << 1) + 1 - e_count];
-                                    prev_hasher[(i >= bin_size_in_bucket / 2) as usize]
-                                        .update(&left_child_hash);
-                                    prev_hasher[(i >= bin_size_in_bucket / 2) as usize]
-                                        .update(&right_child_hash);
+                                    if right_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(right_child_hash);
+                                    }
+                                    if left_child_hash != Hash::default() {
+                                        prev_tier_hasher.update(left_child_hash);
+                                    }
                                     extra_meta_val.left_child_hash = left_child_hash;
                                     extra_meta_val.right_child_hash = right_child_hash;
                                 }
@@ -1037,8 +968,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                             let this_block_hash = encrypt_bucket_and_pre_authenticate::<_, MetaSize>(
                                 idx,
                                 i,
-                                &aes_key,
-                                &hash_key,
+                                aes_key,
+                                hash_key,
                                 &mut data,
                                 block_ctr,
                                 &mut meta_plus_extra,
@@ -1046,36 +977,20 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                                 trusted_merkle_roots,
                             );
                             //authenticate the hashes because the hashes are stored in untrusted domain
-                            if b_idx >= 2 * treetop_max_count {
-                                cur_hasher.update(&this_block_hash);
+                            if b_idx >= 2 * treetop_max_count && this_block_hash != Hash::default()
+                            {
+                                cur_tier_hasher.update(this_block_hash);
                                 hashes[idx - b_count] = this_block_hash;
                             }
-                        }
-                        if b_idx >= 2 * treetop_max_count {
-                            hash_hashes[cur_bin_num - b_count / bin_size_in_bucket] =
-                                cur_hasher.finalize()[..16].try_into().unwrap();
-                        }
-                        //if the current tier is not the lowest tier
-                        if b_count < count as usize >> 1 {
-                            let res_0: [u8; 16] =
-                                prev_hasher.remove(0).finalize()[..16].try_into().unwrap();
-                            let res_1: [u8; 16] =
-                                prev_hasher.remove(0).finalize()[..16].try_into().unwrap();
-                            assert_eq!(
-                                prev_hash_hashes[(cur_bin_num << 1) - e_count / bin_size_in_bucket],
-                                res_0
-                            );
-                            assert_eq!(
-                                prev_hash_hashes
-                                    [(cur_bin_num << 1) + 1 - e_count / bin_size_in_bucket],
-                                res_1
-                            );
                         }
                     }
                     //copy from buffers to the treetop above
                     //no need to encrypt and authenticate
-                    (&mut treetop.data[b_idx..b_idx + delta]).clone_from_slice(&data[..delta]);
-                    (&mut treetop.metadata[b_idx..b_idx + delta]).clone_from_slice(&meta[..delta]);
+                    if b_idx < treetop_max_count {
+                        (&mut treetop.data[b_idx..b_idx + delta]).clone_from_slice(&data[..delta]);
+                        (&mut treetop.metadata[b_idx..b_idx + delta])
+                            .clone_from_slice(&meta[..delta]);
+                    }
 
                     //save the oram buckets
                     helpers::shuffle_push_buckets_ocall(
@@ -1089,6 +1004,11 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     cur_bin_num -= 1;
                     e_idx = b_idx;
                 }
+                if e_count < count as usize {
+                    let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
+                    assert_eq!(prev_tier_hash, h);
+                }
+                prev_tier_hash = cur_tier_hasher.finalize()[..16].try_into().unwrap();
                 e_count = b_count;
                 b_count >>= 1;
                 ALLOCATOR.set_switch(true);
@@ -1096,8 +1016,6 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 prev_hashes = hashes;
                 hashes = vec![Default::default(); b_count];
                 ALLOCATOR.set_switch(false);
-                prev_hash_hashes = hash_hashes;
-                hash_hashes = vec![Default::default(); b_count / bin_size_in_bucket];
             }
         }
         ALLOCATOR.set_switch(true);
@@ -1106,9 +1024,15 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         ALLOCATOR.set_switch(false);
     }
 
+    //build
     //handle the processed array to oram tree
     unsafe {
-        get_oram_tree(shuffle_id, allocation_id);
+        build_oram_from_shuffle_manager(
+            shuffle_id,
+            allocation_id,
+            shuffle_nonce.as_ptr(),
+            shuffle_nonce.len(),
+        );
     }
 }
 
@@ -1130,8 +1054,8 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
 {
     //oblivious random bin assignment
     oblivious_random_bin_assignment::<_, DataSize, MetaSize>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
@@ -1143,8 +1067,8 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
     //note that the bins read may not be equal size
     //so in this step, we adjust the bins to the same size
     oblivious_random_permutation::<_, DataSize, MetaSize>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
@@ -1154,8 +1078,8 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
     );
     //merge sort by new idx, which is more suitable for enclave setting
     non_oblivious_merge_sort::<_, DataSize, MetaSize>(
-        &aes_key,
-        &hash_key,
+        aes_key,
+        hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
@@ -1227,13 +1151,11 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         &mut Vec::new(),
                     );
                     //assign random keys
-                    for key in
-                        random_keys[c * bin_size..(c + 1) * bin_size - bin_size / 2].iter_mut()
-                    {
+                    for key in random_keys[c * bin_size..c * bin_size + bin_size / 2].iter_mut() {
                         *key = (rng.next_u64() & (n as u64 - 1)) + 1;
                     }
                     for key in
-                        random_keys[c * bin_size - bin_size / 2..(c + 1) * bin_size].iter_mut()
+                        random_keys[c * bin_size + bin_size / 2..(c + 1) * bin_size].iter_mut()
                     {
                         *key = DUMMY_KEY_LEFT;
                     }
@@ -1252,22 +1174,15 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         &mut Vec::new(),
                     );
                     //assign random keys
-                    for key in
-                        random_keys[c * bin_size..(c + 1) * bin_size - bin_size / 2].iter_mut()
-                    {
+                    for key in random_keys[c * bin_size..c * bin_size + bin_size / 2].iter_mut() {
                         *key = (rng.next_u64() & (n as u64 - 1)) + 1;
                     }
                     for key in
-                        random_keys[c * bin_size - bin_size / 2..(c + 1) * bin_size].iter_mut()
+                        random_keys[c * bin_size + bin_size / 2..(c + 1) * bin_size].iter_mut()
                     {
                         *key = DUMMY_KEY_LEFT;
                     }
                 } else if i > 0 {
-                    let data_mut = if has_data {
-                        &mut data[c * bin_size..(c + 1) * bin_size]
-                    } else {
-                        &mut data
-                    };
                     pull_bin::<DataSize, MetaSize>(
                         aes_key,
                         hash_key,
@@ -1276,7 +1191,8 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         first_real_bin + j_prime + j + c * pow_i,
                         1,
                         &mut 0,
-                        data_mut,
+                        &mut data[c * bin_size * has_data as usize
+                            ..(c + 1) * bin_size * has_data as usize],
                         &mut meta[c * bin_size..(c + 1) * bin_size],
                         &mut random_keys[c * bin_size..(c + 1) * bin_size],
                     );
@@ -1285,38 +1201,38 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
             merge_split::<DataSize, MetaSize>(&mut data, &mut meta, &mut random_keys, msb_mask);
             //for the last i, remove dummy elements and do not store random keys
             if i == log_b - 1 {
+                //this step does not need to be oblivious
+                let mut search_idx_left = bin_size >> 1;
+                let mut search_idx_right = bin_size + (bin_size >> 1);
+                while search_idx_left <= bin_size - 1
+                    && random_keys[search_idx_left] == DUMMY_KEY_LEFT
+                {
+                    search_idx_left += 1;
+                }
+                while search_idx_left != usize::MAX
+                    && random_keys[search_idx_left] != DUMMY_KEY_LEFT
+                {
+                    search_idx_left = search_idx_left.wrapping_sub(1);
+                }
+                search_idx_left = search_idx_left.wrapping_add(1);
+                assert!(search_idx_left < search_idx_right);
+                while search_idx_right <= (bin_size << 1) - 1
+                    && random_keys[search_idx_right] != DUMMY_KEY_RIGHT
+                {
+                    search_idx_right += 1;
+                }
+                if search_idx_right > (bin_size << 1) - 1 {
+                    search_idx_right -= 1;
+                }
+                while search_idx_right != bin_size - 1
+                    && random_keys[search_idx_right] == DUMMY_KEY_RIGHT
+                {
+                    search_idx_right = search_idx_right.wrapping_sub(1);
+                }
+                search_idx_right = search_idx_right.wrapping_add(1);
+                assert!(search_idx_left <= bin_size);
+                assert!(search_idx_right >= bin_size);
                 for c in [0, 1] {
-                    //this step does not need to be oblivious
-                    let mut search_idx_left = bin_size >> 2;
-                    let mut search_idx_right = search_idx_left + bin_size >> 1;
-                    while search_idx_left <= bin_size - 1
-                        && random_keys[c * bin_size + search_idx_left] == DUMMY_KEY_LEFT
-                    {
-                        search_idx_left += 1;
-                    }
-                    while search_idx_left != (c * bin_size).wrapping_sub(1)
-                        && random_keys[c * bin_size + search_idx_left] != DUMMY_KEY_LEFT
-                    {
-                        search_idx_left = search_idx_left.wrapping_sub(1);
-                    }
-                    search_idx_left = search_idx_left.wrapping_add(1);
-                    assert!(search_idx_left < search_idx_right);
-                    while search_idx_right <= bin_size - 1
-                        && random_keys[c * bin_size + search_idx_right] != DUMMY_KEY_RIGHT
-                    {
-                        search_idx_right += 1;
-                    }
-                    while search_idx_right != (c * bin_size).wrapping_sub(1)
-                        && random_keys[c * bin_size + search_idx_right] == DUMMY_KEY_RIGHT
-                    {
-                        search_idx_right = search_idx_right.wrapping_sub(1);
-                    }
-                    search_idx_right = search_idx_right.wrapping_add(1);
-                    let data_mut = if has_data {
-                        &mut data[c * bin_size + search_idx_left..c * bin_size + search_idx_right]
-                    } else {
-                        &mut data
-                    };
                     push_bin::<_, DataSize, MetaSize>(
                         aes_key,
                         hash_key,
@@ -1324,8 +1240,10 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         shuffle_id,
                         first_real_bin + 2 * j + c,
                         1,
-                        data_mut,
-                        &mut meta[c * bin_size + search_idx_left..c * bin_size + search_idx_right],
+                        &mut data[(c * bin_size + (1 - c) * search_idx_left) * has_data as usize
+                            ..((1 - c) * bin_size + c * search_idx_right) * has_data as usize],
+                        &mut meta[c * bin_size + (1 - c) * search_idx_left
+                            ..(1 - c) * bin_size + c * search_idx_right],
                         &mut Vec::new(),
                         rng,
                     );
@@ -1333,11 +1251,6 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                 random_keys.clear();
             } else {
                 for c in [0, 1] {
-                    let data_mut = if has_data {
-                        &mut data[c * bin_size..(c + 1) * bin_size]
-                    } else {
-                        &mut data
-                    };
                     push_bin::<_, DataSize, MetaSize>(
                         aes_key,
                         hash_key,
@@ -1345,7 +1258,8 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         shuffle_id,
                         first_real_bin + 2 * j + c,
                         1,
-                        data_mut,
+                        &mut data[c * bin_size * has_data as usize
+                            ..(c + 1) * bin_size * has_data as usize],
                         &mut meta[c * bin_size..(c + 1) * bin_size],
                         &mut random_keys[c * bin_size..(c + 1) * bin_size],
                         rng,
@@ -1354,7 +1268,7 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
             }
         }
         unsafe {
-            bin_switch(first_real_bin, first_real_bin + num_bins);
+            bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
         }
         pow_i <<= 1;
     }
@@ -1432,8 +1346,9 @@ fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
         );
         data.truncate(actual_bin_size);
         meta.truncate(actual_bin_size);
-        let mut random_keys = (0..meta.len()).map(|_| rng.next_u64()).collect::<Vec<_>>();
-        bitonic_sort(&mut data, &mut meta, &mut random_keys, 0, true);
+        //necessary? how does it influence performance?
+        data.shrink_to_fit();
+        meta.shrink_to_fit();
 
         if meta.len() >= expected_bin_size {
             let mut remaining_meta = meta.split_off(expected_bin_size);
@@ -1442,6 +1357,10 @@ fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
                 let mut remaining_data = data.split_off(expected_bin_size);
                 acc_data.append(&mut remaining_data);
             }
+            let mut random_keys = (0..expected_bin_size)
+                .map(|_| rng.next_u64())
+                .collect::<Vec<_>>();
+            bitonic_sort(&mut data, &mut meta, &mut random_keys, 0, true);
             push_bin::<_, DataSize, MetaSize>(
                 aes_key,
                 hash_key,
@@ -1487,7 +1406,7 @@ fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
         }
     }
     unsafe {
-        bin_switch(first_real_bin, first_real_bin + num_bins);
+        bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
     }
     assert_eq!(acc_meta.len(), 0);
     assert_eq!(cur_bin_num_new, num_bins);
@@ -1608,7 +1527,7 @@ fn non_oblivious_merge_sort<Rng, DataSize, MetaSize>(
         assert_eq!(cur_bin_num_new, num_bins);
         width <<= 1;
         unsafe {
-            bin_switch(first_real_bin, first_real_bin + num_bins);
+            bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
         }
     }
 }
@@ -1648,27 +1567,22 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
     let mut meta = vec![Default::default(); 2 * bin_size];
     let mut data = vec![Default::default(); 2 * bin_size * has_data as usize];
     for (c, &cur_bin_num) in [i_bin, j_bin].iter().enumerate() {
-        let data_mut = if has_data {
-            &mut data[c * bin_size..(c + 1) * bin_size]
-        } else {
-            &mut data
-        };
         pull_bin::<DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             first_real_bin + cur_bin_num,
             1,
             &mut 0,
-            data_mut,
+            &mut data[c * bin_size * has_data as usize..(c + 1) * bin_size * has_data as usize],
             &mut meta[c * bin_size..(c + 1) * bin_size],
             &mut Vec::new(),
         );
         //if it is the first round, sort the bin itself first
         if width == bin_size {
             bitonic_sort(
-                data_mut,
+                &mut data[c * bin_size * has_data as usize..(c + 1) * bin_size * has_data as usize],
                 &mut meta[c * bin_size..(c + 1) * bin_size],
                 &mut Vec::new(),
                 key_by,
@@ -1686,20 +1600,15 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
         //when exhaust one bin, pull
         if i >= bin_size && i_bin < i_right_bin {
             i = 0;
-            let data_mut = if has_data {
-                &mut data[..bin_size]
-            } else {
-                &mut data
-            };
             pull_bin::<DataSize, MetaSize>(
-                &aes_key,
-                &hash_key,
+                aes_key,
+                hash_key,
                 &freshness_nonce,
                 shuffle_id,
                 first_real_bin + i_bin,
                 1,
                 &mut 0,
-                data_mut,
+                &mut data[..bin_size * has_data as usize],
                 &mut meta[..bin_size],
                 &mut Vec::new(),
             );
@@ -1707,20 +1616,15 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
         }
         if j >= bin_size && j_bin < i_end_bin {
             j = 0;
-            let data_mut = if has_data {
-                &mut data[bin_size..2 * bin_size]
-            } else {
-                &mut data
-            };
             pull_bin::<DataSize, MetaSize>(
-                &aes_key,
-                &hash_key,
+                aes_key,
+                hash_key,
                 &freshness_nonce,
                 shuffle_id,
                 first_real_bin + j_bin,
                 1,
                 &mut 0,
-                data_mut,
+                &mut data[bin_size * has_data as usize..2 * bin_size * has_data as usize],
                 &mut meta[bin_size..2 * bin_size],
                 &mut Vec::new(),
             );
@@ -1744,8 +1648,8 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
         //when form a new bin, push
         if (k + 1) % bin_size == 0 {
             push_bin::<_, DataSize, MetaSize>(
-                &aes_key,
-                &hash_key,
+                aes_key,
+                hash_key,
                 &freshness_nonce,
                 shuffle_id,
                 first_real_bin + *cur_bin_num_new,
@@ -1802,8 +1706,8 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
     let mut continuous_cnt = 0;
     for cur_bin_num in 0..num_bins {
         pull_bin::<DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             first_real_bin + cur_bin_num,
@@ -1837,8 +1741,8 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
             //TODO: check abortion case
         }
         push_bin::<_, DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             first_real_bin + cur_bin_num,
@@ -1850,7 +1754,7 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
         );
     }
     unsafe {
-        bin_switch(first_real_bin, first_real_bin + num_bins);
+        bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
     }
 }
 
@@ -1875,8 +1779,8 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
         let mut last_new_bucket_idx = 0;
         let mut idx_in_block = 0;
         pull_bin::<DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             cur_bin_num,
@@ -1897,8 +1801,8 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
             idx_in_block += 1;
         }
         push_bin::<_, DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             cur_bin_num,
@@ -1910,7 +1814,7 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
         );
     }
     unsafe {
-        bin_switch(0, num_bins);
+        bin_switch(shuffle_id, 0, num_bins);
     }
 }
 
@@ -2024,7 +1928,7 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
             }
         }
         unsafe {
-            bin_switch(0, num_bins);
+            bin_switch(shuffle_id, 0, num_bins);
         }
         pow_i >>= 1;
         k >>= 1;
@@ -2050,8 +1954,8 @@ fn patch_meta<Rng, DataSize, MetaSize>(
     for cur_bin_num in 0..num_bins {
         //And after each pull_bin, the untrusted storage should release corresponding space
         pull_bin::<DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &seal_nonce,
             shuffle_id,
             cur_bin_num,
@@ -2062,8 +1966,8 @@ fn patch_meta<Rng, DataSize, MetaSize>(
             &mut Vec::new(),
         );
         pull_bin::<DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &freshness_nonce,
             shuffle_id,
             cur_bin_num,
@@ -2082,8 +1986,8 @@ fn patch_meta<Rng, DataSize, MetaSize>(
         }
         //for this push_bin, bin_type = 0, because it is consistent with separated data
         push_bin::<_, DataSize, MetaSize>(
-            &aes_key,
-            &hash_key,
+            aes_key,
+            hash_key,
             &seal_nonce,
             shuffle_id,
             cur_bin_num,
@@ -2095,7 +1999,7 @@ fn patch_meta<Rng, DataSize, MetaSize>(
         );
     }
     unsafe {
-        bin_switch(0, num_bins);
+        bin_switch(shuffle_id, 0, num_bins);
     }
 }
 
@@ -2152,23 +2056,58 @@ mod helpers {
         DataSize: ArrayLength<u8> + PartialDiv<U8>,
         MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     {
+        use std::cmp::min;
+        let mut data_ptr = 0;
+        let mut meta_ptr = 0;
+        let mut random_key_ptr = 0;
+        let mut nonce_ptr = 0;
+        let mut hash_ptr = 0;
         unsafe {
             super::shuffle_pull_bin(
                 shuffle_id,
                 cur_bin_num,
                 bin_type,
                 bin_size,
-                data.as_mut_ptr() as *mut u8,
-                data.len() * DataSize::USIZE,
-                meta.as_mut_ptr() as *mut u8,
-                meta.len() * MetaSize::USIZE,
-                random_keys.as_mut_ptr() as *mut u8,
-                random_keys.len() * 8,
-                nonce.as_mut_ptr() as *mut u8,
+                DataSize::USIZE,
+                MetaSize::USIZE,
+                (data.len() > 0) as u8,
+                (meta.len() > 0) as u8,
+                (random_keys.len() > 0) as u8,
                 nonce.len(),
-                hash.as_mut_ptr() as *mut u8,
                 hash.len(),
-            )
+                &mut data_ptr,
+                &mut meta_ptr,
+                &mut random_key_ptr,
+                &mut nonce_ptr,
+                &mut hash_ptr,
+            );
+
+            let src_data_buf = Box::from_raw(data_ptr as *mut Vec<u8>);
+            let src_meta_buf = Box::from_raw(meta_ptr as *mut Vec<u8>);
+            let src_random_key_buf = Box::from_raw(random_key_ptr as *mut Vec<u8>);
+            let src_nonce_buf = Box::from_raw(nonce_ptr as *mut Vec<u8>);
+            let src_hash_buf = Box::from_raw(hash_ptr as *mut Vec<u8>);
+
+            let data_size = min(data.len(), *bin_size) * DataSize::USIZE;
+            let meta_size = min(meta.len(), *bin_size) * MetaSize::USIZE;
+            let random_key_size = min(random_keys.len(), *bin_size) * 8;
+
+            core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data_size)
+                .copy_from_slice(&src_data_buf);
+            core::slice::from_raw_parts_mut(meta.as_mut_ptr() as *mut u8, meta_size)
+                .copy_from_slice(&src_meta_buf);
+            core::slice::from_raw_parts_mut(random_keys.as_mut_ptr() as *mut u8, random_key_size)
+                .copy_from_slice(&src_random_key_buf);
+            nonce.copy_from_slice(&src_nonce_buf);
+            hash.copy_from_slice(&src_hash_buf);
+
+            Box::into_raw(src_data_buf);
+            Box::into_raw(src_meta_buf);
+            Box::into_raw(src_random_key_buf);
+            Box::into_raw(src_nonce_buf);
+            Box::into_raw(src_hash_buf);
+
+            super::shuffle_pull_bin_post(data_ptr, meta_ptr, random_key_ptr, nonce_ptr, hash_ptr);
         }
     }
 
@@ -2212,22 +2151,66 @@ mod helpers {
         DataSize: ArrayLength<u8> + PartialDiv<U8>,
         MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     {
+        let mut data_ptr = 0;
+        let mut meta_ptr = 0;
+        let mut random_key_ptr = 0;
+        let mut nonce_ptr = 0;
+        let mut hash_ptr = 0;
+        let data_size = data.len() * DataSize::USIZE;
+        let meta_size = meta.len() * MetaSize::USIZE;
+        let random_key_size = random_keys.len() * 8;
+        let nonce_size = nonce.len();
+        let hash_size = hash.len();
         unsafe {
+            super::shuffle_push_bin_pre(
+                data_size,
+                meta_size,
+                random_key_size,
+                nonce_size,
+                hash_size,
+                &mut data_ptr,
+                &mut meta_ptr,
+                &mut random_key_ptr,
+                &mut nonce_ptr,
+                &mut hash_ptr,
+            );
+
+            let mut dst_data_buf = Box::from_raw(data_ptr as *mut Vec<u8>);
+            let mut dst_meta_buf = Box::from_raw(meta_ptr as *mut Vec<u8>);
+            let mut dst_random_key_buf = Box::from_raw(random_key_ptr as *mut Vec<u8>);
+            let mut dst_nonce_buf = Box::from_raw(nonce_ptr as *mut Vec<u8>);
+            let mut dst_hash_buf = Box::from_raw(hash_ptr as *mut Vec<u8>);
+            dst_data_buf.copy_from_slice(core::slice::from_raw_parts(
+                data.as_ptr() as *mut u8,
+                data_size,
+            ));
+            dst_meta_buf.copy_from_slice(core::slice::from_raw_parts(
+                meta.as_ptr() as *mut u8,
+                meta_size,
+            ));
+            dst_random_key_buf.copy_from_slice(core::slice::from_raw_parts(
+                random_keys.as_ptr() as *mut u8,
+                random_key_size,
+            ));
+            dst_nonce_buf.copy_from_slice(nonce);
+            dst_hash_buf.copy_from_slice(hash);
+
+            Box::into_raw(dst_data_buf);
+            Box::into_raw(dst_meta_buf);
+            Box::into_raw(dst_random_key_buf);
+            Box::into_raw(dst_nonce_buf);
+            Box::into_raw(dst_hash_buf);
+
             super::shuffle_push_bin(
                 shuffle_id,
                 cur_bin_num,
                 bin_type,
-                data.as_ptr() as *const u8,
-                data.len() * DataSize::USIZE,
-                meta.as_ptr() as *const u8,
-                meta.len() * MetaSize::USIZE,
-                random_keys.as_ptr() as *const u8,
-                random_keys.len() * 8,
-                nonce.as_ptr() as *mut u8,
-                nonce.len(),
-                hash.as_ptr() as *mut u8,
-                hash.len(),
-            )
+                data_ptr,
+                meta_ptr,
+                random_key_ptr,
+                nonce_ptr,
+                hash_ptr,
+            );
         }
     }
 }
@@ -2242,50 +2225,79 @@ extern "C" {
         meta: *mut u8,
         meta_size: usize,
     );
+    //since only shuffle_pull_bin occurs unexpected bugs
+    //i.e., the ocall is not called acutally, so we split
+    //the function into two parts
     fn shuffle_pull_bin(
         shuffle_id: u64,
         cur_bin_num: usize,
         bin_type: u8,
         bin_size: *mut usize,
-        data: *mut u8,
-        data_size: usize,
-        meta: *mut u8,
-        meta_size: usize,
-        random_key: *mut u8,
-        random_key_size: usize,
-        nonce: *mut u8,
+        data_item_size: usize,
+        meta_item_size: usize,
+        has_data: u8,
+        has_meta: u8,
+        has_random_key: u8,
         nonce_size: usize,
-        hash: *mut u8,
         hash_size: usize,
+        data_ptr: *mut usize,
+        meta_ptr: *mut usize,
+        random_key_ptr: *mut usize,
+        nonce_ptr: *mut usize,
+        hash_ptr: *mut usize,
+    );
+    //free the buffer
+    fn shuffle_pull_bin_post(
+        data_ptr: usize,
+        meta_ptr: usize,
+        random_key_ptr: usize,
+        nonce_ptr: usize,
+        hash_ptr: usize,
     );
     fn shuffle_push_buckets(
         shuffle_id: u64,
         b_idx: usize,
         e_idx: usize,
-        databuf: *const u8,
-        databuf_size: usize,
-        metabuf: *const u8,
-        metabuf_size: usize,
+        data: *const u8,
+        data_size: usize,
+        meta: *const u8,
+        meta_size: usize,
+    );
+    //since only shuffle_push_bin occurs unexpected bugs
+    //i.e., the ocall is not called acutally, so we split
+    //the function into two parts
+    //allocate buffer
+    fn shuffle_push_bin_pre(
+        data_size: usize,
+        meta_size: usize,
+        random_key_size: usize,
+        nonce_size: usize,
+        hash_size: usize,
+        data_ptr: *mut usize,
+        meta_ptr: *mut usize,
+        random_key_ptr: *mut usize,
+        nonce_ptr: *mut usize,
+        hash_ptr: *mut usize,
     );
     fn shuffle_push_bin(
         shuffle_id: u64,
         cur_bin_num: usize,
         bin_type: u8,
-        data: *const u8,
-        data_size: usize,
-        meta: *const u8,
-        meta_size: usize,
-        random_key: *const u8,
-        random_key_size: usize,
-        nonce: *const u8,
-        nonce_size: usize,
-        hash: *const u8,
-        hash_size: usize,
+        data_ptr: usize,
+        meta_ptr: usize,
+        random_key_ptr: usize,
+        nonce_ptr: usize,
+        hash_ptr: usize,
     );
     //move the dst bin to src bin, and assert that the src bin is empty now
-    fn bin_switch(begin_bin_idx: usize, end_bin_idx: usize);
+    fn bin_switch(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx: usize);
 
     //the sequential representation of tree is built, we just need to tranfer
     //the ownership to oram manager
-    fn get_oram_tree(shuffle_id: u64, allocation_id: *mut u64);
+    fn build_oram_from_shuffle_manager(
+        shuffle_id: u64,
+        allocation_id: u64,
+        shuffle_nonce: *const u8,
+        shuffle_nonce_size: usize,
+    );
 }

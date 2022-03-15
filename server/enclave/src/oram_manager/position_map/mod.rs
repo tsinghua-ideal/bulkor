@@ -20,12 +20,13 @@ use aligned_cmov::{
 };
 use balanced_tree_index::TreeIndex;
 use rand_core::{CryptoRng, RngCore};
+use subtle::Choice;
 
 use crate::oram_storage::{
     persist_trivial_posmap, recover_trivial_posmap, s_decrypt, s_encrypt, ORAM_KEY,
 };
 use crate::oram_traits::{log2_ceil, ORAMCreator, PositionMap, PositionMapCreator, ORAM};
-use crate::{NonceSize, ID_TO_LOG_POS, SNAPSHOT_ID, IS_LATEST, LIFETIME_ID};
+use crate::{NonceSize, ID_TO_LOG_POS, IS_LATEST, LIFETIME_ID, SNAPSHOT_ID};
 
 /// This threshold is a total guess, this corresponds to four pages
 pub const POS_MAP_THRESHOLD: u64 = 4096;
@@ -50,7 +51,8 @@ impl<R: RngCore + CryptoRng> TrivialPositionMap<R> {
         let snapshot_id = SNAPSHOT_ID.load(Ordering::SeqCst);
         let is_latest = IS_LATEST.load(Ordering::SeqCst);
         let lifetime_id = LIFETIME_ID.load(Ordering::SeqCst);
-        if snapshot_id > 0 && is_latest {
+        //if not latest, we need the loaded_log_pos
+        if snapshot_id > 0 {
             let ns = NonceSize::USIZE;
             //NOTE: should be consistent with `size_triv_pos_map` in lib.rs
             let posmap_len = ns + 16 + 8 + 8 + 8 + size as usize * 4; //no level, but have log pos
@@ -61,23 +63,26 @@ impl<R: RngCore + CryptoRng> TrivialPositionMap<R> {
             s_decrypt(&ORAM_KEY, &mut posmap_buf, 24);
             let loaded_log_pos =
                 u64::from_le_bytes((&posmap_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
-            //check the integrity
-            let loaded_snapshot_id =
-                u64::from_le_bytes((&posmap_buf[(ns + 24)..(ns + 32)]).try_into().unwrap());
-            assert_eq!(loaded_snapshot_id, snapshot_id);
-            let loaded_lifetime_id = 
-                u64::from_le_bytes((&posmap_buf[(ns + 32)..(ns + 40)]).try_into().unwrap());
-            assert_eq!(loaded_lifetime_id, lifetime_id);
             ID_TO_LOG_POS
                 .lock()
                 .unwrap()
                 .insert(snapshot_id, loaded_log_pos);
-            let iter_data = (&posmap_buf[(ns + 40)..]).chunks_exact(4);
-            assert_eq!(iter_data.remainder(), []);
-            data = iter_data
-                .into_iter()
-                .map(|d| u32::from_le_bytes(d.try_into().unwrap()))
-                .collect::<Vec<_>>();
+            //check the integrity
+            let loaded_snapshot_id =
+                u64::from_le_bytes((&posmap_buf[(ns + 24)..(ns + 32)]).try_into().unwrap());
+            assert_eq!(loaded_snapshot_id, snapshot_id);
+            if is_latest {
+                let loaded_lifetime_id =
+                    u64::from_le_bytes((&posmap_buf[(ns + 32)..(ns + 40)]).try_into().unwrap());
+                assert_eq!(loaded_lifetime_id, lifetime_id);
+
+                let iter_data = (&posmap_buf[(ns + 40)..]).chunks_exact(4);
+                assert_eq!(iter_data.remainder(), []);
+                data = iter_data
+                    .into_iter()
+                    .map(|d| u32::from_le_bytes(d.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+            }
         }
 
         Self {
@@ -92,7 +97,7 @@ impl<R: RngCore + CryptoRng> PositionMap for TrivialPositionMap<R> {
     fn len(&self) -> u64 {
         self.data.len() as u64
     }
-    fn write(&mut self, key: &u64, new_val: &u64) -> u64 {
+    fn write(&mut self, key: &u64, new_val: &u64) -> (u64, Choice) {
         debug_assert!(*key < self.data.len() as u64, "key was out of bounds");
         let key = *key as u32;
         let new_val = *new_val as u32;
@@ -103,11 +108,12 @@ impl<R: RngCore + CryptoRng> PositionMap for TrivialPositionMap<R> {
             (&mut self.data[idx]).cmov(test, &new_val);
         }
         // if old_val is zero, sample a random leaf
+        let cond = old_val.ct_eq(&0);
         old_val.cmov(
-            old_val.ct_eq(&0),
+            cond,
             &1u32.random_child_at_height(self.height, &mut self.rng),
         );
-        old_val as u64
+        (old_val as u64, cond)
     }
 
     fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool) {
@@ -194,7 +200,7 @@ where
     fn len(&self) -> u64 {
         self.oram.len() << Self::L
     }
-    fn write(&mut self, key: &u64, new_val: &u64) -> u64 {
+    fn write(&mut self, key: &u64, new_val: &u64) -> (u64, Choice) {
         let new_val = *new_val as u32;
         let upper_key = *key >> Self::L;
         let lower_key = (*key as u32) & ((1u32 << Self::L) - 1);
@@ -209,11 +215,12 @@ where
             old_val
         });
         // if old_val is zero, sample a random leaf
+        let cond = old_val.ct_eq(&0);
         old_val.cmov(
-            old_val.ct_eq(&0),
+            cond,
             &1u32.random_child_at_height(self.height, &mut self.rng),
         );
-        old_val as u64
+        (old_val as u64, cond)
     }
 
     fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool) {

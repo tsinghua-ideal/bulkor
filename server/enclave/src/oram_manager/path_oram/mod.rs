@@ -299,8 +299,10 @@ where
         // Choose what will be the next (secret) position of this item
         let new_pos = 1u64.random_child_at_height(self.height, &mut self.rng);
         // Set the new value and recover the old (current) position.
-        let current_pos = self.pos.write(&key, &new_pos);
+        let (mut current_pos, is_invalid_pos) = self.pos.write(&key, &new_pos);
         debug_assert!(current_pos != 0, "position map told us the item is at 0");
+        let (shuffle_pos, is_valid_shuffle_pos) = self.storage.get_shuffle_pos(&key);
+        current_pos.cmov(is_invalid_pos & is_valid_shuffle_pos, &shuffle_pos);
         // Get the branch where we expect to find the item.
         // NOTE: If we move to a scheme where the tree can be resized dynamically,
         // then we should checkout at `current_pos.random_child_at_height(self.height)`.

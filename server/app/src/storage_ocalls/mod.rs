@@ -192,6 +192,8 @@ struct UntrustedAllocation {
     data_file: File,
     /// The file descriptor for meta file
     meta_file: File,
+    /// the nonce used for shuffle
+    shuffle_nonce: Vec<u8>,
     /// A flag set to true when a thread is in the critical section and released
     /// when it leaves. This is used to trigger assertions if there is a
     /// race happening on this API This is simpler and less expensive than
@@ -233,9 +235,7 @@ impl UntrustedAllocation {
             2u64,
             (1u64 << TREETOP_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) / data_item_size as u64,
         );
-        let count_in_mem = if !is_latest && level == 0 {
-            0 //In this case, the structure is just used for management of buffers and files
-        } else if count <= treetop_max_count as usize {
+        let count_in_mem = if count <= treetop_max_count as usize {
             count
         } else {
             treetop_max_count as usize
@@ -276,9 +276,17 @@ impl UntrustedAllocation {
             .read(true)
             .open(&meta_file_name)
             .unwrap();
+        let mut shuffle_nonce_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open("shuffle_nonce")
+            .unwrap();
+        let mut shuffle_nonce = Vec::new();
+        shuffle_nonce_file.read_to_end(&mut shuffle_nonce).unwrap();
 
         let data_pointer = unsafe {
-            alloc_zeroed(Layout::from_size_align(2 * count_in_mem * data_item_size, 8).unwrap())
+            alloc(Layout::from_size_align(2 * count_in_mem * data_item_size, 8).unwrap())
         };
         if data_pointer.is_null() {
             panic!(
@@ -301,9 +309,16 @@ impl UntrustedAllocation {
 
         //for stale position ORAMs, just initialize them although the snapshot id is not 0
         if snapshot_id == 0 || (!is_latest && level > 0) {
-            let mut data_file_len = data_file.metadata().unwrap().len() as usize;
-            let mut meta_file_len = meta_file.metadata().unwrap().len() as usize;
-            let ptr_file_len = ptr_file.metadata().unwrap().len() as usize;
+            //the following step mainly aims to continue the initalization when the system crash
+            //during the initialization. But it is not necessary and will hinder the clear if
+            //is_latest && level > 0 is true.
+            // let mut data_file_len = data_file.metadata().unwrap().len() as usize;
+            // let mut meta_file_len = meta_file.metadata().unwrap().len() as usize;
+            // let ptr_file_len = ptr_file.metadata().unwrap().len() as usize;
+            let mut data_file_len = 0;
+            let mut meta_file_len = 0;
+            let ptr_file_len = 0;
+
             // Initialization is not finished, so do the initialization
             let zeros = vec![0u8; data_item_size];
             while data_file_len < (2 * count_in_mem + 3 * (count - count_in_mem)) * data_item_size {
@@ -321,16 +336,18 @@ impl UntrustedAllocation {
             meta_file.flush().unwrap();
             ptr_file.flush().unwrap();
         } else {
-            let data = unsafe {
-                core::slice::from_raw_parts_mut(data_pointer, 2 * count_in_mem * data_item_size)
-            };
-            let meta = unsafe {
-                core::slice::from_raw_parts_mut(meta_pointer, 2 * count_in_mem * meta_item_size)
-            };
             //recovery
             //For level==0 && !is_latest case, no data and meta is loaded
-            data_file.read_exact_at(data, 0).unwrap();
-            meta_file.read_exact_at(meta, 0).unwrap();
+            if is_latest {
+                let data = unsafe {
+                    core::slice::from_raw_parts_mut(data_pointer, 2 * count_in_mem * data_item_size)
+                };
+                let meta = unsafe {
+                    core::slice::from_raw_parts_mut(meta_pointer, 2 * count_in_mem * meta_item_size)
+                };
+                data_file.read_exact_at(data, 0).unwrap();
+                meta_file.read_exact_at(meta, 0).unwrap();
+            }
             ptr_file.read_exact_at(&mut ptrs, 0).unwrap();
         }
 
@@ -349,6 +366,7 @@ impl UntrustedAllocation {
             meta_pointer,
             data_file,
             meta_file,
+            shuffle_nonce,
             critical_section_flag,
             checkout_flag,
         }
@@ -372,6 +390,93 @@ impl Drop for UntrustedAllocation {
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn pull_all_elements(
+    id: u64,
+    databuf: *mut u8,
+    databuf_len: usize,
+    metabuf: *mut u8,
+    metabuf_len: usize,
+) {
+    let ptr: *const UntrustedAllocation = core::mem::transmute(id);
+
+    let count_in_mem = (*ptr).count_in_mem;
+    let data_item_size = (*ptr).data_item_size;
+    let meta_item_size = (*ptr).meta_item_size;
+
+    let ptrs = &(*ptr).ptrs;
+    let data_buf = core::slice::from_raw_parts_mut(databuf, databuf_len);
+    let meta_buf = core::slice::from_raw_parts_mut(metabuf, metabuf_len);
+
+    for idx in 0..(*ptr).count {
+        let p = get_sts_ptr(ptrs, idx).2;
+        if idx < count_in_mem {
+            (*ptr)
+                .data_file
+                .read_exact_at(
+                    &mut data_buf[data_item_size * idx..data_item_size * (idx + 1)],
+                    (data_item_size * (2 * idx + p)) as u64,
+                )
+                .unwrap();
+            (*ptr)
+                .meta_file
+                .read_exact_at(
+                    &mut meta_buf[meta_item_size * idx..meta_item_size * (idx + 1)],
+                    (meta_item_size * (2 * idx + p)) as u64,
+                )
+                .unwrap();
+        } else {
+            (*ptr)
+                .data_file
+                .read_exact_at(
+                    &mut data_buf[data_item_size * idx..data_item_size * (idx + 1)],
+                    (data_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
+                )
+                .unwrap();
+            (*ptr)
+                .meta_file
+                .read_exact_at(
+                    &mut meta_buf[meta_item_size * idx..meta_item_size * (idx + 1)],
+                    (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
+                )
+                .unwrap();
+        }
+    }
+
+    //check the buf
+    for idx in 0..(*ptr).count as usize {
+        let p = get_sts_ptr(ptrs, idx).2;
+        let default = vec![0u8; meta_item_size];
+        if &meta_buf[meta_item_size * idx..meta_item_size * (idx + 1)] == &default {
+            if idx < count_in_mem {
+                let mut buf = vec![0; meta_item_size * 2];
+                (*ptr)
+                    .meta_file
+                    .read_exact_at(&mut buf, (meta_item_size * (2 * idx)) as u64)
+                    .unwrap();
+                println!(
+                    "untrusted domain, dummy meta idx = {:?}, buf = {:?}, p = {:?}",
+                    idx, buf, p
+                );
+            } else {
+                let mut buf = vec![0; meta_item_size * 3];
+                (*ptr)
+                    .meta_file
+                    .read_exact_at(
+                        &mut buf,
+                        (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3)) as u64,
+                    )
+                    .unwrap();
+                println!(
+                    "untrusted domain, dummy meta idx = {:?}, buf = {:?}, p = {:?}",
+                    idx, buf, p
+                );
+            }
+            continue;
+        }
+    }
+}
+
 // These extern "C" functions must match edl file
 
 /// # Safety
@@ -387,10 +492,14 @@ pub extern "C" fn allocate_oram_storage(
     data_size: u64,
     meta_size: u64,
     id_out: *mut u64,
+    shuffle_nonce: *mut u8,
+    shuffle_nonce_size: u64,
 ) {
     let mut m = LEVEL_TO_ORAM_INST.lock().unwrap();
     let id = m.entry(level).or_insert(0);
     println!("id = {:?}", id);
+    let shuffle_nonce =
+        unsafe { core::slice::from_raw_parts_mut(shuffle_nonce, shuffle_nonce_size as usize) };
     if *id == 0 || (*id > 0 && is_latest == 0 && level > 0) {
         //The read of stale data ORAM should not take this branch
         if *id > 0 && is_latest == 0 {
@@ -424,6 +533,18 @@ pub extern "C" fn allocate_oram_storage(
     unsafe {
         *id_out = *id;
     }
+    get_shuffle_nonce(*id, shuffle_nonce);
+}
+
+fn get_shuffle_nonce(id: u64, shuffle_nonce: &mut [u8]) {
+    let storage = unsafe {
+        core::mem::transmute::<_, *mut UntrustedAllocation>(id)
+            .as_mut()
+            .unwrap()
+    };
+    if shuffle_nonce.len() == storage.shuffle_nonce.len() {
+        shuffle_nonce.copy_from_slice(&storage.shuffle_nonce);
+    }
 }
 
 #[no_mangle]
@@ -433,8 +554,11 @@ pub extern "C" fn allocate_shuffle_manager(
     bin_size_in_block: usize,
     shuffle_id: *mut u64,
 ) {
-    let storage =
-        unsafe { Box::<UntrustedAllocation>::from_raw(core::mem::transmute(allocation_id)) };
+    let storage = unsafe {
+        core::mem::transmute::<_, *mut UntrustedAllocation>(allocation_id)
+            .as_mut()
+            .unwrap()
+    };
     assert!(
         !storage.critical_section_flag.swap(true, Ordering::SeqCst),
         "Could not enter critical section when releasing storage"
@@ -444,117 +568,59 @@ pub extern "C" fn allocate_shuffle_manager(
     let meta_item_size = storage.meta_item_size;
     let count_in_mem = storage.count_in_mem;
 
-    let buf_count = std::cmp::min(storage.count, storage.treetop_max_count as usize);
     let num_bins = 2 * z as usize * storage.count / bin_size_in_block;
-    let mut dst_data_buf = vec![0; buf_count * data_item_size];
-    let mut dst_meta_buf = vec![0; buf_count * meta_item_size];
-    let dst_data_file_name = PathBuf::from("shuffle_data");
-    let dst_meta_file_name = PathBuf::from("shuffle_meta");
-    let mut dst_data_file = OpenOptions::new()
+
+    let swap_data_file_name = PathBuf::from("shuffle_data_swap");
+    let swap_meta_file_name = PathBuf::from("shuffle_meta_swap");
+    let mut swap_data_file = OpenOptions::new()
         .create(true)
         .write(true)
         .read(true)
-        .open(&dst_data_file_name)
+        .open(&swap_data_file_name)
         .unwrap();
-    let mut dst_meta_file = OpenOptions::new()
+    let mut swap_meta_file = OpenOptions::new()
         .create(true)
         .write(true)
         .read(true)
-        .open(&dst_meta_file_name)
+        .open(&swap_meta_file_name)
         .unwrap();
+    let mut swap_ptrs = Vec::new();
 
-    let src_data_buf = unsafe {
-        core::slice::from_raw_parts(storage.data_pointer, 2 * count_in_mem * data_item_size)
-    };
-    let src_meta_buf = unsafe {
-        core::slice::from_raw_parts(storage.meta_pointer, 2 * count_in_mem * meta_item_size)
-    };
-
-    for idx in 0..storage.count {
-        let p = get_sts_ptr(&storage.ptrs, idx).2;
-        if idx < buf_count && idx < count_in_mem {
-            (&mut dst_data_buf[data_item_size * idx..data_item_size * (idx + 1)]).copy_from_slice(
-                &src_data_buf[(2 * idx + p) * data_item_size..(2 * idx + p + 1) * data_item_size],
-            );
-        } else if idx < buf_count && idx >= count_in_mem {
-            storage
-                .data_file
-                .read_exact_at(
-                    &mut dst_data_buf[data_item_size * idx..data_item_size * (idx + 1)],
-                    (data_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
-                )
-                .unwrap();
-        } else if idx >= buf_count && idx < count_in_mem {
-            dst_data_file
-                .write_all(
-                    &src_data_buf
-                        [(2 * idx + p) * data_item_size..(2 * idx + p + 1) * data_item_size],
-                )
-                .unwrap();
-        } else {
-            let mut tmp_buf = vec![0; data_item_size];
-            storage
-                .data_file
-                .read_exact_at(
-                    &mut tmp_buf,
-                    (data_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
-                )
-                .unwrap();
-            dst_data_file.write_all(&tmp_buf).unwrap();
-        }
-    }
-    for idx in 0..storage.count {
-        let p = get_sts_ptr(&storage.ptrs, idx).2;
-        if idx < buf_count && idx < count_in_mem {
-            (&mut dst_meta_buf[meta_item_size * idx..meta_item_size * (idx + 1)]).copy_from_slice(
-                &src_meta_buf[(2 * idx + p) * meta_item_size..(2 * idx + p + 1) * meta_item_size],
-            );
-        } else if idx < buf_count && idx >= count_in_mem {
-            storage
-                .meta_file
-                .read_exact_at(
-                    &mut dst_meta_buf[meta_item_size * idx..meta_item_size * (idx + 1)],
-                    (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
-                )
-                .unwrap();
-        } else if idx >= buf_count && idx < count_in_mem {
-            dst_meta_file
-                .write_all(
-                    &src_meta_buf
-                        [(2 * idx + p) * meta_item_size..(2 * idx + p + 1) * meta_item_size],
-                )
-                .unwrap();
-        } else {
-            let mut tmp_buf = vec![0; meta_item_size];
-            storage
-                .meta_file
-                .read_exact_at(
-                    &mut tmp_buf,
-                    (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
-                )
-                .unwrap();
-            dst_meta_file.write_all(&tmp_buf).unwrap();
-        }
-    }
+    std::mem::swap(&mut storage.data_file, &mut swap_data_file);
+    std::mem::swap(&mut storage.meta_file, &mut swap_meta_file);
+    std::mem::swap(&mut storage.ptrs, &mut swap_ptrs);
 
     LEVEL_TO_ORAM_INST
         .lock()
         .unwrap()
         .remove(&storage.level)
         .unwrap();
-    drop(storage);
+    #[cfg(debug_assertions)]
+    //free the memory but still hold the file descriptor
+    unsafe {
+        dealloc(
+            storage.data_pointer as *mut u8,
+            Layout::from_size_align_unchecked(2 * count_in_mem * data_item_size, 8),
+        );
+        dealloc(
+            storage.meta_pointer as *mut u8,
+            Layout::from_size_align_unchecked(2 * count_in_mem * meta_item_size, 8),
+        );
+    }
+    assert!(
+        storage.critical_section_flag.swap(false, Ordering::SeqCst),
+        "Could not leave critical section when persisting storage"
+    );
     #[cfg(debug_assertions)]
     debug_checks::remove_id(allocation_id);
 
     let shuffle_manager = Box::new(ShuffleManager::new(
-        z,
-        buf_count,
         data_item_size,
         meta_item_size,
-        dst_data_buf,
-        dst_meta_buf,
-        dst_data_file,
-        dst_meta_file,
+        count_in_mem,
+        swap_ptrs,
+        swap_data_file,
+        swap_meta_file,
         num_bins,
     ));
     let id = Box::into_raw(shuffle_manager) as u64;
@@ -562,6 +628,99 @@ pub extern "C" fn allocate_shuffle_manager(
     unsafe {
         *shuffle_id = id;
     }
+}
+
+#[no_mangle]
+pub extern "C" fn build_oram_from_shuffle_manager(
+    shuffle_id: u64,
+    allocation_id: u64,
+    shuffle_nonce: *const u8,
+    shuffle_nonce_size: usize,
+) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    SHUFFLE_MANAGER_ID.store(0, Ordering::SeqCst);
+    let mut manager =
+        unsafe { Box::from_raw(core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id)) };
+    //TODO: may need lock for manager, but no need for storage, because the storage id is removed
+    let storage = unsafe {
+        core::mem::transmute::<_, *mut UntrustedAllocation>(allocation_id)
+            .as_mut()
+            .unwrap()
+    };
+    let shuffle_nonce = unsafe { core::slice::from_raw_parts(shuffle_nonce, shuffle_nonce_size) };
+    storage.shuffle_nonce = shuffle_nonce.to_vec();
+    //persist shuffle_nonce
+    let shuffle_nonce_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .open("shuffle_nonce")
+        .unwrap();
+    shuffle_nonce_file.write_all_at(&shuffle_nonce, 0).unwrap();
+
+    let data_item_size = storage.data_item_size;
+    let meta_item_size = storage.meta_item_size;
+    let count_in_mem = storage.count_in_mem;
+
+    //alloc because space is released in allocate_shuffle_manager
+    let data_pointer =
+        unsafe { alloc(Layout::from_size_align(2 * count_in_mem * data_item_size, 8).unwrap()) };
+    if data_pointer.is_null() {
+        panic!(
+            "Could not allocate memory for data segment: {}",
+            2 * count_in_mem * data_item_size
+        )
+    }
+    let meta_pointer = unsafe {
+        alloc_zeroed(Layout::from_size_align(2 * count_in_mem * meta_item_size, 8).unwrap())
+    };
+    if meta_pointer.is_null() {
+        panic!(
+            "Could not allocate memory for meta segment: {}",
+            2 * count_in_mem * meta_item_size
+        )
+    }
+
+    let data =
+        unsafe { core::slice::from_raw_parts_mut(data_pointer, 2 * count_in_mem * data_item_size) };
+    let meta =
+        unsafe { core::slice::from_raw_parts_mut(meta_pointer, 2 * count_in_mem * meta_item_size) };
+
+    std::mem::swap(&mut storage.data_file, &mut manager.data_bucket_file);
+    std::mem::swap(&mut storage.meta_file, &mut manager.meta_bucket_file);
+    std::mem::swap(&mut storage.ptrs, &mut manager.ptrs);
+
+    storage.data_file.read_exact_at(data, 0).unwrap();
+    storage.meta_file.read_exact_at(meta, 0).unwrap();
+
+    storage.data_pointer = data_pointer;
+    storage.meta_pointer = meta_pointer;
+
+    drop(manager);
+    //delete shuffle files
+    {
+        //read from disk
+        let path = Path::new("./");
+        for entry in fs::read_dir(path).expect("reading directory fails") {
+            if let Ok(entry) = entry {
+                let file = entry.path();
+                let filename = file.to_str().unwrap();
+
+                if filename.contains("shuffle_") && !filename.contains("nonce") {
+                    remove_file(file).unwrap();
+                }
+            }
+        }
+    }
+
+    //no need to deal with ptr_file
+    assert!(LEVEL_TO_ORAM_INST
+        .lock()
+        .unwrap()
+        .insert(0, allocation_id)
+        .is_none());
+    #[cfg(debug_assertions)]
+    debug_checks::add_id(allocation_id);
 }
 
 /// # Safety
@@ -616,12 +775,12 @@ pub unsafe extern "C" fn persist_oram_storage(
     let count_in_mem = (*ptr).count_in_mem;
     let data = core::slice::from_raw_parts((*ptr).data_pointer, 2 * count_in_mem * data_item_size);
     let meta = core::slice::from_raw_parts((*ptr).meta_pointer, 2 * count_in_mem * meta_item_size);
-    let ptrs_m = &mut (*ptr).ptrs;
+    let ptrs_m_mut = &mut (*ptr).ptrs;
 
     //on disk persistence
     if is_volatile == 0 {
-        clear_all_sts(ptrs_m, usize::MAX);
-        let ptrs_m = ptrs_m.clone(); //avoid blocking access
+        let ptrs_m = ptrs_m_mut.clone(); //avoid blocking access
+        clear_all_sts(ptrs_m_mut, usize::MAX);
         let old_snapshot_id = LAST_ON_DISK_SNAPSHOT_ID.load(Ordering::SeqCst);
         let old_ptr_file_name = PathBuf::from(
             "ptr_".to_string() + &old_snapshot_id.to_string() + "-" + &level.to_string(),
@@ -666,8 +825,8 @@ pub unsafe extern "C" fn persist_oram_storage(
         }
 
         //on disk snapshot switch
-        clear_all_sts(&mut ptrs_d, count_in_mem - 1);
         (&mut ptrs_d[count_in_mem / 2..]).copy_from_slice(&ptrs_m[count_in_mem / 2..]);
+        clear_all_sts(&mut ptrs_d, usize::MAX);
 
         let new_ptr_file_name =
             PathBuf::from("ptr_".to_string() + &snapshot_id.to_string() + "-" + &level.to_string());
@@ -681,12 +840,12 @@ pub unsafe extern "C" fn persist_oram_storage(
         new_ptr_file.write_all(&ptrs_d).unwrap();
     } else {
         //in mem snapshot switch
-        clear_all_in_mem_sts(ptrs_m, count_in_mem - 1);
+        clear_all_in_mem_sts(ptrs_m_mut, count_in_mem - 1);
     }
 
     assert!(
         (*ptr).critical_section_flag.swap(false, Ordering::SeqCst),
-        "Could not leave critical section when checking out storage"
+        "Could not leave critical section when persisting storage"
     );
     println!("end persist_oram_storage");
 }
@@ -1335,6 +1494,187 @@ pub extern "C" fn recover_trivial_posmap(posmap: *mut u8, posmap_len: usize, sna
         }
     }
     println!("end recover_trivial_posmap");
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_pull_buckets(
+    shuffle_id: u64,
+    b_idx: usize,
+    e_idx: usize,
+    data: *mut u8,
+    data_size: usize,
+    meta: *mut u8,
+    meta_size: usize,
+) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    //TODO: may need lock
+    let data = unsafe { core::slice::from_raw_parts_mut(data, data_size) };
+    let meta = unsafe { core::slice::from_raw_parts_mut(meta, meta_size) };
+    manager.pull_buckets(b_idx, e_idx, data, meta);
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_pull_bin(
+    shuffle_id: u64,
+    cur_bin_num: usize,
+    bin_type: u8,
+    bin_size: *mut usize,
+    data_item_size: usize,
+    meta_item_size: usize,
+    has_data: u8,
+    has_meta: u8,
+    has_random_key: u8,
+    nonce_size: usize,
+    hash_size: usize,
+    data_ptr: *mut usize,
+    meta_ptr: *mut usize,
+    random_key_ptr: *mut usize,
+    nonce_ptr: *mut usize,
+    hash_ptr: *mut usize,
+) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    //TODO: may need lock
+    let bin_size = unsafe { bin_size.as_mut().unwrap() };
+    let (data, meta, random_keys, nonce, hash) = manager.pull_bin(
+        cur_bin_num,
+        bin_type,
+        bin_size,
+        data_item_size,
+        meta_item_size,
+        has_data != 0,
+        has_meta != 0,
+        has_random_key != 0,
+        nonce_size,
+        hash_size,
+    );
+    unsafe {
+        *data_ptr = Box::into_raw(Box::new(data)) as usize;
+        *meta_ptr = Box::into_raw(Box::new(meta)) as usize;
+        *random_key_ptr = Box::into_raw(Box::new(random_keys)) as usize;
+        *nonce_ptr = Box::into_raw(Box::new(nonce)) as usize;
+        *hash_ptr = Box::into_raw(Box::new(hash)) as usize;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn shuffle_pull_bin_post(
+    data_ptr: usize,
+    meta_ptr: usize,
+    random_key_ptr: usize,
+    nonce_ptr: usize,
+    hash_ptr: usize,
+) {
+    let _data_buf = Box::from_raw(data_ptr as *mut Vec<u8>);
+    let _meta_buf = Box::from_raw(meta_ptr as *mut Vec<u8>);
+    let _random_key_buf = Box::from_raw(random_key_ptr as *mut Vec<u8>);
+    let _nonce_buf = Box::from_raw(nonce_ptr as *mut Vec<u8>);
+    let _hash_buf = Box::from_raw(hash_ptr as *mut Vec<u8>);
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_push_buckets(
+    shuffle_id: u64,
+    b_idx: usize,
+    e_idx: usize,
+    data: *const u8,
+    data_size: usize,
+    meta: *const u8,
+    meta_size: usize,
+) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    //TODO: may need lock
+    let data = unsafe { core::slice::from_raw_parts(data, data_size) };
+    let meta = unsafe { core::slice::from_raw_parts(meta, meta_size) };
+    manager.push_buckets(b_idx, e_idx, data, meta);
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_push_bin_pre(
+    data_size: usize,
+    meta_size: usize,
+    random_key_size: usize,
+    nonce_size: usize,
+    hash_size: usize,
+    data_ptr: *mut usize,
+    meta_ptr: *mut usize,
+    random_key_ptr: *mut usize,
+    nonce_ptr: *mut usize,
+    hash_ptr: *mut usize,
+) {
+    let data = Box::new(vec![0u8; data_size]);
+    let meta = Box::new(vec![0u8; meta_size]);
+    let random_keys = Box::new(vec![0u8; random_key_size]);
+    let nonce = Box::new(vec![0u8; nonce_size]);
+    let hash = Box::new(vec![0u8; hash_size]);
+
+    unsafe {
+        *data_ptr = Box::into_raw(data) as usize;
+        *meta_ptr = Box::into_raw(meta) as usize;
+        *random_key_ptr = Box::into_raw(random_keys) as usize;
+        *nonce_ptr = Box::into_raw(nonce) as usize;
+        *hash_ptr = Box::into_raw(hash) as usize;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_push_bin(
+    shuffle_id: u64,
+    cur_bin_num: usize,
+    bin_type: u8,
+    data_ptr: usize,
+    meta_ptr: usize,
+    random_key_ptr: usize,
+    nonce_ptr: usize,
+    hash_ptr: usize,
+) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    //TODO: may need lock
+    let data = unsafe { Box::from_raw(data_ptr as *mut Vec<u8>) };
+    let meta = unsafe { Box::from_raw(meta_ptr as *mut Vec<u8>) };
+    let random_keys = unsafe { Box::from_raw(random_key_ptr as *mut Vec<u8>) };
+    let nonce = unsafe { Box::from_raw(nonce_ptr as *mut Vec<u8>) };
+    let hash = unsafe { Box::from_raw(hash_ptr as *mut Vec<u8>) };
+    manager.push_bin(
+        cur_bin_num,
+        bin_type,
+        &data,
+        &meta,
+        &random_keys,
+        &nonce,
+        &hash,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn bin_switch(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx: usize) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    //TODO: may need lock
+    manager.bin_switch(begin_bin_idx, end_bin_idx);
 }
 
 // This module is only used in debug builds, it allows us to ensure that an id

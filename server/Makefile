@@ -278,5 +278,5 @@ clean:
 	@cd enclave && cargo clean && rm -f Cargo.lock
 	@cd $(APP_DIR) && cargo clean && rm -f Cargo.lock
 	@cd lib && rm -rf *.a
-	@cd bin && rm -rf data* meta* stash* treetop* merkle_roots* trivial_posmap* running.log log ptr*
+	@cd bin && rm -rf data* meta* stash* treetop* merkle_roots* trivial_posmap* running.log log ptr* shuffle*
 	@rm -rf $(TCMALLOC_Objects)

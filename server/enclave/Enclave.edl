@@ -40,6 +40,12 @@ enclave {
     untrusted {
         void* sbrk_o(size_t size);
 
+        void pull_all_elements(uint64_t id,
+                            [out, count=databuf_len] uint8_t * databuf,
+                            size_t databuf_len,
+                            [out, count=metabuf_len] uint8_t * metabuf,
+                            size_t metabuf_len);
+
         /// Ask untrusted to allocate oram storage
         ///
         /// This means, roughly, two arrays of byte arrays:
@@ -77,7 +83,9 @@ enclave {
                                    uint64_t count,
                                    uint64_t data_size,
                                    uint64_t meta_size,
-                                   [out] uint64_t * id);
+                                   [out] uint64_t * id,
+                                   [out, count=shuffle_nonce_size] uint8_t * shuffle_nonce,
+                                   uint64_t shuffle_nonce_size);
 
         /// Prepare for global shuffle on ORAM indexed by allocation_id
         void allocate_shuffle_manager(uint64_t allocation_id, uint64_t z, size_t bin_size_in_block, [out] uint64_t * shuffle_id);
@@ -246,16 +254,25 @@ enclave {
             size_t cur_bin_num,
             uint8_t bin_type,
             [out] size_t * bin_size,
-            [out, count=data_size] uint8_t * data,
-            size_t data_size,
-            [out, count=meta_size] uint8_t * meta,
-            size_t meta_size,
-            [out, count=random_key_size] uint8_t * random_key,
-            size_t random_key_size,
-            [out, count=nonce_size] uint8_t * nonce,
+            size_t data_item_size,
+            size_t meta_item_size,
+            uint8_t has_data,
+            uint8_t has_meta,
+            uint8_t has_random_key,
             size_t nonce_size,
-            [out, count=hash_size] uint8_t * hash,
-            size_t hash_size);
+            size_t hash_size,
+            [out] size_t * data_ptr,
+            [out] size_t * meta_ptr,
+            [out] size_t * random_key_ptr,
+            [out] size_t * nonce_ptr,
+            [out] size_t * hash_ptr);
+
+        void shuffle_pull_bin_post(
+            size_t data_ptr,
+            size_t meta_ptr,
+            size_t random_key_ptr,
+            size_t nonce_ptr,
+            size_t hash_ptr);
 
         void shuffle_push_buckets(uint64_t shuffle_id,
             size_t b_idx,
@@ -265,23 +282,33 @@ enclave {
             [in, count=meta_size] const uint8_t * meta,
             size_t meta_size);
         
+        void shuffle_push_bin_pre(
+            size_t data_size,
+            size_t meta_size,
+            size_t random_key_size,
+            size_t nonce_size,
+            size_t hash_size,
+            [out] size_t * data_ptr,
+            [out] size_t * meta_ptr,
+            [out] size_t * random_key_ptr,
+            [out] size_t * nonce_ptr,
+            [out] size_t * hash_ptr);
+
         void shuffle_push_bin(uint64_t shuffle_id,
             size_t cur_bin_num,
             uint8_t bin_type,
-            [in, count=data_size] const uint8_t * data,
-            size_t data_size,
-            [in, count=meta_size] const uint8_t * meta,
-            size_t meta_size,
-            [in, count=random_key_size] const uint8_t * random_key,
-            size_t random_key_size,
-            [in, count=nonce_size] const uint8_t * nonce,
-            size_t nonce_size,
-            [in, count=hash_size] const uint8_t * hash,
-            size_t hash_size);
+            size_t data_ptr,
+            size_t meta_ptr,
+            size_t random_key_ptr,
+            size_t nonce_ptr,
+            size_t hash_ptr);
 
-        void bin_switch(size_t begin_bin_idx, size_t end_bin_idx);
+        void bin_switch(uint64_t shuffle_id, size_t begin_bin_idx, size_t end_bin_idx);
 
-        void get_oram_tree(uint64_t shuffle_id, [out] uint64_t * allocation_id);
+        void build_oram_from_shuffle_manager(uint64_t shuffle_id, 
+            uint64_t allocation_id, 
+            [in, count=shuffle_nonce_size] uint8_t * shuffle_nonce,
+            size_t shuffle_nonce_size);
     };
 
 };

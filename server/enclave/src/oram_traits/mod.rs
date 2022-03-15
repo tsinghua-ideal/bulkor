@@ -104,6 +104,9 @@ pub trait ORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: 
         volatile: bool,
         rng: &mut Rng,
     );
+
+    // This it the API for get the pos after shuffle
+    fn get_shuffle_pos(&self, key: &u64) -> (u64, Choice);
 }
 
 /// An Oblivious RAM -- that is, an array like [A8Bytes<ValueSize>; N]
@@ -205,7 +208,7 @@ pub trait PositionMap {
     /// The new value should be a random nonce from a CSPRNG.
     /// Returns the old value.
     /// It is illegal to write to a key that is out of bounds.
-    fn write(&mut self, key: &u64, new_val: &u64) -> u64;
+    fn write(&mut self, key: &u64, new_val: &u64) -> (u64, Choice);
 
     /// This is the API for persisting the ORAM metadata, including stash and pos map
     fn persist(&mut self, lifetime_id: u64, new_snapshot_id: u64, volatile: bool);

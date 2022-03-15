@@ -305,13 +305,17 @@ fn main() {
 
     //let n = 8 << 20; //8M*1KB
     let n = 8 << 10;
+    let now = Instant::now();
     let (enclave, eid, remaining_results) = init_enclave_and_oram(n);
 
-    serve(enclave, eid, n, remaining_results);
+    //serve(enclave, eid, n, remaining_results);
     //exercise_oram(10000, n, eid);
-    //sanity_check(eid);
-    //enclave.destroy();
-    //release_all_oram_storage();
+    sanity_check(eid);
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("shuffle n = {:?} 1KB blocks cost {:?} s", n, dur);
+
+    enclave.destroy();
+    release_all_oram_storage();
 
     //SGX_ERROR_INVALID_ENCLAVE_ID
 }
