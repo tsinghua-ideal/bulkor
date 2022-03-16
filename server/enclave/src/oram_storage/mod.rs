@@ -429,8 +429,8 @@ where
                 // If untrusted gave us all 0's for the metadata, then the result is all zeroes
                 // Otherwise we have to decrypt
                 if self.meta_scratch_buffer[idx] == Default::default() {
-                    //dest[idx] = Default::default();
-                    //dest_meta[idx] = Default::default();
+                    dest[idx] = Default::default();
+                    dest_meta[idx] = Default::default();
                     last_hash = Some((indices[idx], Default::default()));
                 } else {
                     // Compute the hash for this block

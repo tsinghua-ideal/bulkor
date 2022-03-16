@@ -356,20 +356,21 @@ pub fn exercise_oram(num_rounds: usize, len: u64, eid: sgx_enclave_id_t) {
 
 /// Exercise an ORAM by writing, reading, and rewriting, all locations
 /// consecutively
-pub fn exercise_oram_consecutive(mut num_rounds: usize, len: u64, eid: sgx_enclave_id_t) {
+pub fn exercise_oram_consecutive(num_rounds: usize, len: u64, eid: sgx_enclave_id_t) {
+    let mut cur_num_rounds = num_rounds;
     let mut rng = RngType::from_seed([7u8; 32]);
     assert!(len != 0, "len is zero");
     assert_eq!(len & (len - 1), 0, "len is not a power of two");
-    //let mut expected = BTreeMap::<u64, A64Bytes<BlockSize>>::default();
+    //let mut expected = BTreeMap::<u64, A64Bytes<StorageBlockSize>>::default();
 
     let mut acc_dur = 0f64;
-    while num_rounds > 0 {
-        let query = num_rounds as u64 & (len - 1);
+    while cur_num_rounds > 0 {
+        let query = cur_num_rounds as u64 & (len - 1);
         //let expected_ent = expected.entry(query).or_default();
         let mut val: A64Bytes<StorageBlockSize> = Default::default();
         rng.fill_bytes(&mut val);
         let _res = simple_access_wrapper(query, val, eid, &mut rng, &mut acc_dur);
-        num_rounds -= 1;
+        cur_num_rounds -= 1;
     }
     let per_dur = acc_dur / (num_rounds as f64);
     println!(
