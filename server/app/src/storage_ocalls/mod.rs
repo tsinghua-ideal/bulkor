@@ -294,9 +294,15 @@ impl UntrustedAllocation {
                 2 * count_in_mem * data_item_size
             )
         }
-        let meta_pointer = unsafe {
-            alloc_zeroed(Layout::from_size_align(2 * count_in_mem * meta_item_size, 8).unwrap())
+        let meta_pointer = if snapshot_id > 0 && !is_latest && level == 0 {
+            //zero is filled during build oram from shuffle manager
+            unsafe { alloc(Layout::from_size_align(2 * count_in_mem * meta_item_size, 8).unwrap()) }
+        } else {
+            unsafe {
+                alloc_zeroed(Layout::from_size_align(2 * count_in_mem * meta_item_size, 8).unwrap())
+            }
         };
+
         if meta_pointer.is_null() {
             panic!(
                 "Could not allocate memory for meta segment: {}",
@@ -566,47 +572,14 @@ pub extern "C" fn allocate_shuffle_manager(
 
     let data_item_size = storage.data_item_size;
     let meta_item_size = storage.meta_item_size;
-    let count_in_mem = storage.count_in_mem;
 
     let num_bins = 2 * z as usize * storage.count / bin_size_in_block;
-
-    let swap_data_file_name = PathBuf::from("shuffle_data_swap");
-    let swap_meta_file_name = PathBuf::from("shuffle_meta_swap");
-    let mut swap_data_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open(&swap_data_file_name)
-        .unwrap();
-    let mut swap_meta_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open(&swap_meta_file_name)
-        .unwrap();
-    let mut swap_ptrs = Vec::new();
-
-    std::mem::swap(&mut storage.data_file, &mut swap_data_file);
-    std::mem::swap(&mut storage.meta_file, &mut swap_meta_file);
-    std::mem::swap(&mut storage.ptrs, &mut swap_ptrs);
 
     LEVEL_TO_ORAM_INST
         .lock()
         .unwrap()
         .remove(&storage.level)
         .unwrap();
-    #[cfg(debug_assertions)]
-    //free the memory but still hold the file descriptor
-    unsafe {
-        dealloc(
-            storage.data_pointer as *mut u8,
-            Layout::from_size_align_unchecked(2 * count_in_mem * data_item_size, 8),
-        );
-        dealloc(
-            storage.meta_pointer as *mut u8,
-            Layout::from_size_align_unchecked(2 * count_in_mem * meta_item_size, 8),
-        );
-    }
     assert!(
         storage.critical_section_flag.swap(false, Ordering::SeqCst),
         "Could not leave critical section when persisting storage"
@@ -615,12 +588,9 @@ pub extern "C" fn allocate_shuffle_manager(
     debug_checks::remove_id(allocation_id);
 
     let shuffle_manager = Box::new(ShuffleManager::new(
+        allocation_id,
         data_item_size,
         meta_item_size,
-        count_in_mem,
-        swap_ptrs,
-        swap_data_file,
-        swap_meta_file,
         num_bins,
     ));
     let id = Box::into_raw(shuffle_manager) as u64;
@@ -641,6 +611,8 @@ pub extern "C" fn build_oram_from_shuffle_manager(
     SHUFFLE_MANAGER_ID.store(0, Ordering::SeqCst);
     let mut manager =
         unsafe { Box::from_raw(core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id)) };
+    //release the space,
+    drop(manager);
     //TODO: may need lock for manager, but no need for storage, because the storage id is removed
     let storage = unsafe {
         core::mem::transmute::<_, *mut UntrustedAllocation>(allocation_id)
@@ -657,61 +629,6 @@ pub extern "C" fn build_oram_from_shuffle_manager(
         .open("shuffle_nonce")
         .unwrap();
     shuffle_nonce_file.write_all_at(&shuffle_nonce, 0).unwrap();
-
-    let data_item_size = storage.data_item_size;
-    let meta_item_size = storage.meta_item_size;
-    let count_in_mem = storage.count_in_mem;
-
-    //alloc because space is released in allocate_shuffle_manager
-    let data_pointer =
-        unsafe { alloc(Layout::from_size_align(2 * count_in_mem * data_item_size, 8).unwrap()) };
-    if data_pointer.is_null() {
-        panic!(
-            "Could not allocate memory for data segment: {}",
-            2 * count_in_mem * data_item_size
-        )
-    }
-    let meta_pointer = unsafe {
-        alloc_zeroed(Layout::from_size_align(2 * count_in_mem * meta_item_size, 8).unwrap())
-    };
-    if meta_pointer.is_null() {
-        panic!(
-            "Could not allocate memory for meta segment: {}",
-            2 * count_in_mem * meta_item_size
-        )
-    }
-
-    let data =
-        unsafe { core::slice::from_raw_parts_mut(data_pointer, 2 * count_in_mem * data_item_size) };
-    let meta =
-        unsafe { core::slice::from_raw_parts_mut(meta_pointer, 2 * count_in_mem * meta_item_size) };
-
-    std::mem::swap(&mut storage.data_file, &mut manager.data_bucket_file);
-    std::mem::swap(&mut storage.meta_file, &mut manager.meta_bucket_file);
-    std::mem::swap(&mut storage.ptrs, &mut manager.ptrs);
-
-    storage.data_file.read_exact_at(data, 0).unwrap();
-    storage.meta_file.read_exact_at(meta, 0).unwrap();
-
-    storage.data_pointer = data_pointer;
-    storage.meta_pointer = meta_pointer;
-
-    drop(manager);
-    //delete shuffle files
-    {
-        //read from disk
-        let path = Path::new("./");
-        for entry in fs::read_dir(path).expect("reading directory fails") {
-            if let Ok(entry) = entry {
-                let file = entry.path();
-                let filename = file.to_str().unwrap();
-
-                if filename.contains("shuffle_") && !filename.contains("nonce") {
-                    remove_file(file).unwrap();
-                }
-            }
-        }
-    }
 
     //no need to deal with ptr_file
     assert!(LEVEL_TO_ORAM_INST
@@ -1545,7 +1462,7 @@ pub extern "C" fn shuffle_pull_bin(
     };
     //TODO: may need lock
     let bin_size = unsafe { bin_size.as_mut().unwrap() };
-    let (data, meta, random_keys, nonce, hash) = manager.pull_bin(
+    manager.pull_bin(
         cur_bin_num,
         bin_type,
         bin_size,
@@ -1558,38 +1475,21 @@ pub extern "C" fn shuffle_pull_bin(
         hash_size,
     );
     unsafe {
-        *data_ptr = Box::into_raw(Box::new(data)) as usize;
-        *meta_ptr = Box::into_raw(Box::new(meta)) as usize;
-        *random_key_ptr = Box::into_raw(Box::new(random_keys)) as usize;
-        *nonce_ptr = Box::into_raw(Box::new(nonce)) as usize;
-        *hash_ptr = Box::into_raw(Box::new(hash)) as usize;
+        *data_ptr = (&mut manager.tmp_buf.0) as *mut Vec<u8> as usize;
+        *meta_ptr = (&mut manager.tmp_buf.1) as *mut Vec<u8> as usize;
+        *random_key_ptr = (&mut manager.tmp_buf.2) as *mut Vec<u8> as usize;
+        *nonce_ptr = (&mut manager.tmp_buf.3) as *mut Vec<u8> as usize;
+        *hash_ptr = (&mut manager.tmp_buf.4) as *mut Vec<u8> as usize;
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn shuffle_pull_bin_post(
-    data_ptr: usize,
-    meta_ptr: usize,
-    random_key_ptr: usize,
-    nonce_ptr: usize,
-    hash_ptr: usize,
-) {
-    let _data_buf = Box::from_raw(data_ptr as *mut Vec<u8>);
-    let _meta_buf = Box::from_raw(meta_ptr as *mut Vec<u8>);
-    let _random_key_buf = Box::from_raw(random_key_ptr as *mut Vec<u8>);
-    let _nonce_buf = Box::from_raw(nonce_ptr as *mut Vec<u8>);
-    let _hash_buf = Box::from_raw(hash_ptr as *mut Vec<u8>);
-}
-
-#[no_mangle]
-pub extern "C" fn shuffle_push_buckets(
+pub extern "C" fn shuffle_push_buckets_pre(
     shuffle_id: u64,
-    b_idx: usize,
-    e_idx: usize,
-    data: *const u8,
     data_size: usize,
-    meta: *const u8,
     meta_size: usize,
+    data_ptr: *mut usize,
+    meta_ptr: *mut usize,
 ) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
@@ -1597,14 +1497,34 @@ pub extern "C" fn shuffle_push_buckets(
             .as_mut()
             .unwrap()
     };
+    manager.tmp_buf = (
+        vec![0u8; data_size],
+        vec![0u8; meta_size],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    unsafe {
+        *data_ptr = (&mut manager.tmp_buf.0) as *mut Vec<u8> as usize;
+        *meta_ptr = (&mut manager.tmp_buf.1) as *mut Vec<u8> as usize;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_push_buckets(shuffle_id: u64, b_idx: usize, e_idx: usize) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
     //TODO: may need lock
-    let data = unsafe { core::slice::from_raw_parts(data, data_size) };
-    let meta = unsafe { core::slice::from_raw_parts(meta, meta_size) };
-    manager.push_buckets(b_idx, e_idx, data, meta);
+    manager.push_buckets(b_idx, e_idx);
 }
 
 #[no_mangle]
 pub extern "C" fn shuffle_push_bin_pre(
+    shuffle_id: u64,
     data_size: usize,
     meta_size: usize,
     random_key_size: usize,
@@ -1616,32 +1536,30 @@ pub extern "C" fn shuffle_push_bin_pre(
     nonce_ptr: *mut usize,
     hash_ptr: *mut usize,
 ) {
-    let data = Box::new(vec![0u8; data_size]);
-    let meta = Box::new(vec![0u8; meta_size]);
-    let random_keys = Box::new(vec![0u8; random_key_size]);
-    let nonce = Box::new(vec![0u8; nonce_size]);
-    let hash = Box::new(vec![0u8; hash_size]);
-
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    manager.tmp_buf = (
+        vec![0u8; data_size],
+        vec![0u8; meta_size],
+        vec![0u8; random_key_size],
+        vec![0u8; nonce_size],
+        vec![0u8; hash_size],
+    );
     unsafe {
-        *data_ptr = Box::into_raw(data) as usize;
-        *meta_ptr = Box::into_raw(meta) as usize;
-        *random_key_ptr = Box::into_raw(random_keys) as usize;
-        *nonce_ptr = Box::into_raw(nonce) as usize;
-        *hash_ptr = Box::into_raw(hash) as usize;
+        *data_ptr = (&mut manager.tmp_buf.0) as *mut Vec<u8> as usize;
+        *meta_ptr = (&mut manager.tmp_buf.1) as *mut Vec<u8> as usize;
+        *random_key_ptr = (&mut manager.tmp_buf.2) as *mut Vec<u8> as usize;
+        *nonce_ptr = (&mut manager.tmp_buf.3) as *mut Vec<u8> as usize;
+        *hash_ptr = (&mut manager.tmp_buf.4) as *mut Vec<u8> as usize;
     }
 }
 
 #[no_mangle]
-pub extern "C" fn shuffle_push_bin(
-    shuffle_id: u64,
-    cur_bin_num: usize,
-    bin_type: u8,
-    data_ptr: usize,
-    meta_ptr: usize,
-    random_key_ptr: usize,
-    nonce_ptr: usize,
-    hash_ptr: usize,
-) {
+pub extern "C" fn shuffle_push_bin(shuffle_id: u64, cur_bin_num: usize, bin_type: u8) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
         (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
@@ -1649,20 +1567,7 @@ pub extern "C" fn shuffle_push_bin(
             .unwrap()
     };
     //TODO: may need lock
-    let data = unsafe { Box::from_raw(data_ptr as *mut Vec<u8>) };
-    let meta = unsafe { Box::from_raw(meta_ptr as *mut Vec<u8>) };
-    let random_keys = unsafe { Box::from_raw(random_key_ptr as *mut Vec<u8>) };
-    let nonce = unsafe { Box::from_raw(nonce_ptr as *mut Vec<u8>) };
-    let hash = unsafe { Box::from_raw(hash_ptr as *mut Vec<u8>) };
-    manager.push_bin(
-        cur_bin_num,
-        bin_type,
-        &data,
-        &meta,
-        &random_keys,
-        &nonce,
-        &hash,
-    );
+    manager.push_bin(cur_bin_num, bin_type);
 }
 
 #[no_mangle]
@@ -1675,6 +1580,18 @@ pub extern "C" fn bin_switch(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx:
     };
     //TODO: may need lock
     manager.bin_switch(begin_bin_idx, end_bin_idx);
+}
+
+#[no_mangle]
+pub extern "C" fn clear_content(shuffle_id: u64) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    //TODO: may need lock
+    manager.clear_content();
 }
 
 // This module is only used in debug builds, it allows us to ensure that an id

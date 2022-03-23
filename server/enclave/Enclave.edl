@@ -267,22 +267,17 @@ enclave {
             [out] size_t * nonce_ptr,
             [out] size_t * hash_ptr);
 
-        void shuffle_pull_bin_post(
-            size_t data_ptr,
-            size_t meta_ptr,
-            size_t random_key_ptr,
-            size_t nonce_ptr,
-            size_t hash_ptr);
+        void shuffle_push_buckets_pre(uint64_t shuffle_id,
+            size_t data_size,
+            size_t meta_size,
+            [out] size_t * data_ptr,
+            [out] size_t * meta_ptr);
 
         void shuffle_push_buckets(uint64_t shuffle_id,
             size_t b_idx,
-            size_t e_idx,
-            [in, count=data_size] const uint8_t * data,
-            size_t data_size,
-            [in, count=meta_size] const uint8_t * meta,
-            size_t meta_size);
+            size_t e_idx);
         
-        void shuffle_push_bin_pre(
+        void shuffle_push_bin_pre(uint64_t shuffle_id,
             size_t data_size,
             size_t meta_size,
             size_t random_key_size,
@@ -296,14 +291,11 @@ enclave {
 
         void shuffle_push_bin(uint64_t shuffle_id,
             size_t cur_bin_num,
-            uint8_t bin_type,
-            size_t data_ptr,
-            size_t meta_ptr,
-            size_t random_key_ptr,
-            size_t nonce_ptr,
-            size_t hash_ptr);
+            uint8_t bin_type);
 
         void bin_switch(uint64_t shuffle_id, size_t begin_bin_idx, size_t end_bin_idx);
+
+        void clear_content(uint64_t shuffle_id);
 
         void build_oram_from_shuffle_manager(uint64_t shuffle_id, 
             uint64_t allocation_id, 

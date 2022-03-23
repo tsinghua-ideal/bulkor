@@ -1,5 +1,5 @@
 use crate::oram_storage::{compute_block_hash, make_aes_nonce, ExtraMeta, ExtraMetaSize, Hash};
-use crate::oram_traits::HeapORAMStorage;
+use crate::oram_traits::{log2_ceil, HeapORAMStorage};
 use crate::{AuthCipherType, AuthNonceSize, CipherType, KeySize, NonceSize, ALLOCATOR};
 use aes::cipher::{NewCipher, StreamCipher};
 use aligned_cmov::{
@@ -11,7 +11,6 @@ use aligned_cmov::{
 use blake2::{digest::Digest, Blake2b};
 use rand_core::{CryptoRng, RngCore};
 use sgx_trts::trts::rsgx_read_rand;
-use std::boxed::Box;
 use std::convert::TryInto;
 use std::ops::{Add, Deref, Div};
 use std::vec::Vec;
@@ -633,41 +632,32 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     }
     println!("finish pull all oram buckets");
 
-    //whether there is a modification to new idx
-    //if so, do bucket oblivious sort (new leaf num, old idx, new idx) by new idx
-    //actually, for obliviousness, a bucket oblivious sort should be performed log(n) times
-    let mut cur_num_bins = num_bins;
-    let mut first_real_bin = 0;
-    //note that there are at least num_bins * (BIN_SIZE_IN_BLOCK / 2) / 2 dummy blocks
-    //so for the rounds except the first round, the following function will skip processing
-    //The first num_bins / 2 bins
-    while cur_num_bins >= 2 {
-        bucket_oblivious_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
-            aes_key,
-            hash_key,
-            &freshness_nonce,
-            shuffle_id,
-            cur_num_bins,
-            first_real_bin,
-            2,
-            false,
-            rng,
-        );
-        cur_num_bins >>= 1;
-        if first_real_bin == 0 {
-            first_real_bin = num_bins / 2;
-        }
-        //if a bucket holds blocks more than its capacity, move excess blocks from leaf to root
-        oblivious_push_location_upwards::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
-            aes_key,
-            hash_key,
-            &freshness_nonce,
-            shuffle_id,
-            cur_num_bins,
-            first_real_bin,
-            rng,
-        );
-    }
+    bucket_oblivious_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
+        aes_key,
+        hash_key,
+        &freshness_nonce,
+        shuffle_id,
+        num_bins,
+        0,
+        2,
+        false,
+        rng,
+    );
+    println!("finish bucket oblivious sort");
+
+    //if a bucket holds blocks more than its capacity, move excess blocks from leaf to root
+    oblivious_push_location_upwards::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
+        aes_key,
+        hash_key,
+        &freshness_nonce,
+        shuffle_id,
+        log2_ceil(count),
+        num_bins,
+        0,
+        rng,
+    );
+    println!("finish push location upwards");
+
     //change the new idx in bucket to new idx in block
     //TODO: if freshness nonce is changed per round, check it
     oblivious_idx_transformation::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
@@ -678,6 +668,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         num_bins,
         rng,
     );
+    println!("finish idx transformation");
 
     //oblivious placement according to new idx, and assign idx of vacant place to dummy blocks
     oblivious_placement::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>>(
@@ -688,6 +679,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         num_bins,
         rng,
     );
+    println!("finish oblivious placement");
 
     //bucket oblivious sort info by old idx
     bucket_oblivious_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
@@ -701,6 +693,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         false,
         rng,
     );
+    println!("finish bucket oblivious sort");
 
     //patch the sorted info to original blocks
     patch_meta::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>>(
@@ -730,6 +723,9 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         rng,
     );
     println!("finish bucket oblivious sort data and meta");
+    unsafe {
+        clear_content(shuffle_id);
+    }
 
     //authenticate blocks as in oram tree. During the procedure,
     //clear the new idx, that is, restore the function of counter and reset it to 0
@@ -1023,6 +1019,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         drop(prev_hashes);
         ALLOCATOR.set_switch(false);
     }
+    println!("finish oram bucket push");
 
     //build
     //handle the processed array to oram tree
@@ -1034,6 +1031,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
             shuffle_nonce.len(),
         );
     }
+    println!("finish build oram from shuffle manager");
 }
 
 fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
@@ -1668,11 +1666,13 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
     assert!(sorted_meta.is_empty());
 }
 
+//the height is actually the standard definition plus 1
 fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
     aes_key: &GenericArray<u8, KeySize>,
     hash_key: &GenericArray<u8, KeySize>,
     freshness_nonce: &GenericArray<u8, NonceSize>,
     shuffle_id: u64,
+    height: u32,
     num_bins: usize,
     first_real_bin: usize,
     rng: &mut Rng,
@@ -1682,28 +1682,11 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
     Z: Unsigned,
     Rng: RngCore + CryptoRng,
 {
-    fn core_f<MetaSize: ArrayLength<u8> + PartialDiv<U8>, Z: Unsigned>(
-        last_new_idx: &mut u64,
-        continuous_cnt: &mut u64,
-        meta: &mut [A8Bytes<MetaSize>],
-    ) {
-        for meta_item in meta {
-            let new_idx = &mut meta_item.as_mut_ne_u64_slice()[2];
-            let cond_clear_cnt = new_idx.ct_gt(last_new_idx);
-            *last_new_idx = *new_idx;
-            //if different value, reset the counter
-            continuous_cnt.cmov(cond_clear_cnt, &0);
-            *continuous_cnt += 1;
-            let cond_modify_idx = continuous_cnt.ct_gt(&Z::U64);
-            //assume there are more blocks exceeding the capacity of a bucket
-            new_idx.cmov(cond_modify_idx, &(*new_idx >> 1));
-        }
-    }
+    let mut occupied_cnt = vec![0 as u32; height as usize];
+    let mut last_new_idx = 0;
     //no dummy elements in bin (but dummy ORAM blocks exist)
     let bin_size = BIN_SIZE_IN_BLOCK >> 1;
     let mut meta = vec![Default::default(); bin_size];
-    let mut last_new_idx = 0;
-    let mut continuous_cnt = 0;
     for cur_bin_num in 0..num_bins {
         pull_bin::<DataSize, MetaSize>(
             aes_key,
@@ -1717,29 +1700,43 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
             &mut meta,
             &mut Vec::new(),
         );
-        core_f::<_, Z>(&mut last_new_idx, &mut continuous_cnt, &mut meta);
-        //push location inside a bin
-        if num_bins == 1 {
-            let mut boundary = bin_size;
-            while boundary >= Z::USIZE * 2 {
-                last_new_idx = 0;
-                continuous_cnt = 0;
-                bitonic_sort::<DataSize, MetaSize>(
-                    &mut Vec::new(),
-                    &mut meta[0..boundary],
-                    &mut Vec::new(),
-                    2,
-                    true,
-                );
-                boundary >>= 1;
-                core_f::<_, Z>(
-                    &mut last_new_idx,
-                    &mut continuous_cnt,
-                    &mut meta[0..boundary],
-                );
+
+        for meta_item in meta.iter_mut() {
+            let new_idx = &mut meta_item.as_mut_ne_u64_slice()[2];
+
+            let bit_arr = last_new_idx ^ *new_idx;
+            last_new_idx = *new_idx;
+
+            let mut mask = 1 << (height - 1);
+            let mut k = 0;
+            let mut is_first = true;
+            let mut clear_sep = height;
+            while k < height {
+                let cond = Choice::from(((bit_arr & mask) > 0 && is_first) as u8);
+                clear_sep.cmov(cond, &k);
+                is_first.cmov(cond, &false);
+                mask >>= 1;
+                k += 1;
             }
-            //TODO: check abortion case
+
+            for j in 0..height {
+                let cond = Choice::from((j >= clear_sep) as u8);
+                occupied_cnt[j as usize].cmov(cond, &0);
+            }
+
+            let mut is_first = true;
+            for j in (0..height).rev() {
+                let cond = Choice::from((occupied_cnt[j as usize] < Z::U32 && is_first) as u8);
+                let next_idx = *new_idx >> (height - 1 - j);
+                let next_cnt = occupied_cnt[j as usize] + 1;
+                new_idx.cmov(cond, &next_idx);
+                occupied_cnt[j as usize].cmov(cond, &next_cnt);
+                is_first.cmov(cond, &false);
+            }
+
+            //TODO: assign stash addr
         }
+
         push_bin::<_, DataSize, MetaSize>(
             aes_key,
             hash_key,
@@ -1774,10 +1771,10 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
     //TODO: note the freshness_nonce issue;
     let bin_size = BIN_SIZE_IN_BLOCK >> 1;
     let mut meta = vec![Default::default(); bin_size];
+    let mut last_new_bucket_idx = 0;
+    let mut idx_in_block = 0;
 
-    for cur_bin_num in num_bins / 2..num_bins {
-        let mut last_new_bucket_idx = 0;
-        let mut idx_in_block = 0;
+    for cur_bin_num in 0..num_bins {
         pull_bin::<DataSize, MetaSize>(
             aes_key,
             hash_key,
@@ -1790,15 +1787,17 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
             &mut meta,
             &mut Vec::new(),
         );
-        for meta_item in meta.iter_mut() {
-            let new_idx = &mut meta_item.as_mut_ne_u64_slice()[2];
-            let cond_clear = new_idx.ct_gt(&last_new_bucket_idx) | new_idx.ct_eq(&0);
-            last_new_bucket_idx = *new_idx;
-            //if different value, reset the counter
-            idx_in_block.cmov(cond_clear, &0);
-            //for dummy block, (new) block idx should be 0
-            *new_idx = *new_idx * Z::U64 + idx_in_block;
-            idx_in_block += 1;
+        if cur_bin_num >= num_bins / 2 {
+            for meta_item in meta.iter_mut() {
+                let new_idx = &mut meta_item.as_mut_ne_u64_slice()[2];
+                let cond_clear = new_idx.ct_gt(&last_new_bucket_idx) | new_idx.ct_eq(&0);
+                last_new_bucket_idx = *new_idx;
+                //if different value, reset the counter
+                idx_in_block.cmov(cond_clear, &0);
+                //for dummy block, (new) block idx should be 0
+                *new_idx = *new_idx * Z::U64 + idx_in_block;
+                idx_in_block += 1;
+            }
         }
         push_bin::<_, DataSize, MetaSize>(
             aes_key,
@@ -2082,32 +2081,24 @@ mod helpers {
                 &mut hash_ptr,
             );
 
-            let src_data_buf = Box::from_raw(data_ptr as *mut Vec<u8>);
-            let src_meta_buf = Box::from_raw(meta_ptr as *mut Vec<u8>);
-            let src_random_key_buf = Box::from_raw(random_key_ptr as *mut Vec<u8>);
-            let src_nonce_buf = Box::from_raw(nonce_ptr as *mut Vec<u8>);
-            let src_hash_buf = Box::from_raw(hash_ptr as *mut Vec<u8>);
+            let src_data_buf = (data_ptr as *mut Vec<u8>).as_ref().unwrap();
+            let src_meta_buf = (meta_ptr as *mut Vec<u8>).as_ref().unwrap();
+            let src_random_key_buf = (random_key_ptr as *mut Vec<u8>).as_ref().unwrap();
+            let src_nonce_buf = (nonce_ptr as *mut Vec<u8>).as_ref().unwrap();
+            let src_hash_buf = (hash_ptr as *mut Vec<u8>).as_ref().unwrap();
 
             let data_size = min(data.len(), *bin_size) * DataSize::USIZE;
             let meta_size = min(meta.len(), *bin_size) * MetaSize::USIZE;
             let random_key_size = min(random_keys.len(), *bin_size) * 8;
 
             core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data_size)
-                .copy_from_slice(&src_data_buf);
+                .copy_from_slice(src_data_buf);
             core::slice::from_raw_parts_mut(meta.as_mut_ptr() as *mut u8, meta_size)
-                .copy_from_slice(&src_meta_buf);
+                .copy_from_slice(src_meta_buf);
             core::slice::from_raw_parts_mut(random_keys.as_mut_ptr() as *mut u8, random_key_size)
-                .copy_from_slice(&src_random_key_buf);
-            nonce.copy_from_slice(&src_nonce_buf);
-            hash.copy_from_slice(&src_hash_buf);
-
-            Box::into_raw(src_data_buf);
-            Box::into_raw(src_meta_buf);
-            Box::into_raw(src_random_key_buf);
-            Box::into_raw(src_nonce_buf);
-            Box::into_raw(src_hash_buf);
-
-            super::shuffle_pull_bin_post(data_ptr, meta_ptr, random_key_ptr, nonce_ptr, hash_ptr);
+                .copy_from_slice(src_random_key_buf);
+            nonce.copy_from_slice(src_nonce_buf);
+            hash.copy_from_slice(src_hash_buf);
         }
     }
 
@@ -2124,16 +2115,32 @@ mod helpers {
     ) {
         debug_assert!(e_idx - b_idx == data.len());
         debug_assert!(e_idx - b_idx == meta.len());
+        let mut data_ptr = 0;
+        let mut meta_ptr = 0;
+        let data_size = data.len() * DataSize::USIZE;
+        let meta_size = meta.len() * MetaSize::USIZE;
+
         unsafe {
-            super::shuffle_push_buckets(
+            super::shuffle_push_buckets_pre(
                 shuffle_id,
-                b_idx,
-                e_idx,
-                data.as_ptr() as *const u8,
-                data.len() * DataSize::USIZE,
-                meta.as_ptr() as *const u8,
-                meta.len() * MetaSize::USIZE,
-            )
+                data_size,
+                meta_size,
+                &mut data_ptr,
+                &mut meta_ptr,
+            );
+
+            let dst_data_buf = (data_ptr as *mut Vec<u8>).as_mut().unwrap();
+            let dst_meta_buf = (meta_ptr as *mut Vec<u8>).as_mut().unwrap();
+            dst_data_buf.copy_from_slice(core::slice::from_raw_parts(
+                data.as_ptr() as *mut u8,
+                data_size,
+            ));
+            dst_meta_buf.copy_from_slice(core::slice::from_raw_parts(
+                meta.as_ptr() as *mut u8,
+                meta_size,
+            ));
+
+            super::shuffle_push_buckets(shuffle_id, b_idx, e_idx);
         }
     }
 
@@ -2163,6 +2170,7 @@ mod helpers {
         let hash_size = hash.len();
         unsafe {
             super::shuffle_push_bin_pre(
+                shuffle_id,
                 data_size,
                 meta_size,
                 random_key_size,
@@ -2175,11 +2183,11 @@ mod helpers {
                 &mut hash_ptr,
             );
 
-            let mut dst_data_buf = Box::from_raw(data_ptr as *mut Vec<u8>);
-            let mut dst_meta_buf = Box::from_raw(meta_ptr as *mut Vec<u8>);
-            let mut dst_random_key_buf = Box::from_raw(random_key_ptr as *mut Vec<u8>);
-            let mut dst_nonce_buf = Box::from_raw(nonce_ptr as *mut Vec<u8>);
-            let mut dst_hash_buf = Box::from_raw(hash_ptr as *mut Vec<u8>);
+            let dst_data_buf = (data_ptr as *mut Vec<u8>).as_mut().unwrap();
+            let dst_meta_buf = (meta_ptr as *mut Vec<u8>).as_mut().unwrap();
+            let dst_random_key_buf = (random_key_ptr as *mut Vec<u8>).as_mut().unwrap();
+            let dst_nonce_buf = (nonce_ptr as *mut Vec<u8>).as_mut().unwrap();
+            let dst_hash_buf = (hash_ptr as *mut Vec<u8>).as_mut().unwrap();
             dst_data_buf.copy_from_slice(core::slice::from_raw_parts(
                 data.as_ptr() as *mut u8,
                 data_size,
@@ -2195,22 +2203,7 @@ mod helpers {
             dst_nonce_buf.copy_from_slice(nonce);
             dst_hash_buf.copy_from_slice(hash);
 
-            Box::into_raw(dst_data_buf);
-            Box::into_raw(dst_meta_buf);
-            Box::into_raw(dst_random_key_buf);
-            Box::into_raw(dst_nonce_buf);
-            Box::into_raw(dst_hash_buf);
-
-            super::shuffle_push_bin(
-                shuffle_id,
-                cur_bin_num,
-                bin_type,
-                data_ptr,
-                meta_ptr,
-                random_key_ptr,
-                nonce_ptr,
-                hash_ptr,
-            );
+            super::shuffle_push_bin(shuffle_id, cur_bin_num, bin_type);
         }
     }
 }
@@ -2226,8 +2219,8 @@ extern "C" {
         meta_size: usize,
     );
     //since only shuffle_pull_bin occurs unexpected bugs
-    //i.e., the ocall is not called acutally, so we split
-    //the function into two parts
+    //i.e., the ocall is not called acutally, so we don't
+    //use the stash
     fn shuffle_pull_bin(
         shuffle_id: u64,
         cur_bin_num: usize,
@@ -2246,28 +2239,20 @@ extern "C" {
         nonce_ptr: *mut usize,
         hash_ptr: *mut usize,
     );
-    //free the buffer
-    fn shuffle_pull_bin_post(
-        data_ptr: usize,
-        meta_ptr: usize,
-        random_key_ptr: usize,
-        nonce_ptr: usize,
-        hash_ptr: usize,
-    );
-    fn shuffle_push_buckets(
+    fn shuffle_push_buckets_pre(
         shuffle_id: u64,
-        b_idx: usize,
-        e_idx: usize,
-        data: *const u8,
         data_size: usize,
-        meta: *const u8,
         meta_size: usize,
+        data_ptr: *mut usize,
+        meta_ptr: *mut usize,
     );
+    fn shuffle_push_buckets(shuffle_id: u64, b_idx: usize, e_idx: usize);
     //since only shuffle_push_bin occurs unexpected bugs
     //i.e., the ocall is not called acutally, so we split
     //the function into two parts
     //allocate buffer
     fn shuffle_push_bin_pre(
+        shuffle_id: u64,
         data_size: usize,
         meta_size: usize,
         random_key_size: usize,
@@ -2279,18 +2264,11 @@ extern "C" {
         nonce_ptr: *mut usize,
         hash_ptr: *mut usize,
     );
-    fn shuffle_push_bin(
-        shuffle_id: u64,
-        cur_bin_num: usize,
-        bin_type: u8,
-        data_ptr: usize,
-        meta_ptr: usize,
-        random_key_ptr: usize,
-        nonce_ptr: usize,
-        hash_ptr: usize,
-    );
+    fn shuffle_push_bin(shuffle_id: u64, cur_bin_num: usize, bin_type: u8);
     //move the dst bin to src bin, and assert that the src bin is empty now
     fn bin_switch(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx: usize);
+    //clear all unneccessary content
+    fn clear_content(shuffle_id: u64);
 
     //the sequential representation of tree is built, we just need to tranfer
     //the ownership to oram manager

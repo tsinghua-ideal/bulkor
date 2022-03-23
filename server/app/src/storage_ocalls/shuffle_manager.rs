@@ -1,19 +1,15 @@
-use crate::storage_ocalls::{get_sts_ptr, set_ptr};
-use std::fs::{self, remove_file, File, OpenOptions};
+use crate::storage_ocalls::{get_sts_ptr, set_ptr, UntrustedAllocation};
+use std::fs::{self, remove_file, rename, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 pub struct ShuffleManager {
+    storage_id: u64,
     data_size: usize, //Bucket data
     meta_size: usize, //Bucket meta (not block meta) plus extra
     num_bins: usize,
     num_bins_on_disk: usize,
-    //before separation or after combination, info from oram tree
-    count_in_mem: usize,
-    pub ptrs: Vec<u8>,
-    pub data_bucket_file: File,
-    pub meta_bucket_file: File,
     //after separation or before combination
     //denoted as idle bins
     data_bin_buf: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
@@ -31,18 +27,12 @@ pub struct ShuffleManager {
     dst_bin_file_idx: Vec<u64>,
     src_bin_file: File,
     dst_bin_file: File,
+    //temp buf
+    pub tmp_buf: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 impl ShuffleManager {
-    pub fn new(
-        data_size: usize,
-        meta_size: usize,
-        count_in_mem: usize,
-        ptrs: Vec<u8>,
-        data_bucket_file: File,
-        meta_bucket_file: File,
-        num_bins: usize,
-    ) -> Self {
+    pub fn new(storage_id: u64, data_size: usize, meta_size: usize, num_bins: usize) -> Self {
         //temporarily set
         //in this setting, the second half are placed in memory, while the first half are placed on disk
         //it is easy to handle bin switch, because for cur_num_bins <= num_bins/2, the bins we are
@@ -81,14 +71,11 @@ impl ShuffleManager {
             .unwrap();
 
         ShuffleManager {
+            storage_id,
             data_size,
             meta_size,
             num_bins,
             num_bins_on_disk,
-            count_in_mem,
-            ptrs,
-            data_bucket_file,
-            meta_bucket_file,
             data_bin_buf: vec![Default::default(); num_bins - num_bins_on_disk],
             meta_bin_buf: vec![Default::default(); num_bins - num_bins_on_disk],
             data_bin_file_idx: vec![u64::MAX; num_bins_on_disk],
@@ -101,29 +88,109 @@ impl ShuffleManager {
             dst_bin_file_idx: vec![u64::MAX; num_bins_on_disk],
             src_bin_file,
             dst_bin_file,
+            tmp_buf: Default::default(),
+        }
+    }
+
+    pub fn clear_content(&mut self) {
+        println!("manager.src_bins.cap = {:?}, manager.dst_bins.cap = {:?}, manager.data_bins.cap = {:?}, manager.meta_bins.cap = {:?}",  
+            self.src_bins.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity() + x.3.capacity() + x.4.capacity()).sum::<usize>(),
+            self.dst_bins.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity() + x.3.capacity() + x.4.capacity()).sum::<usize>(),
+            self.data_bin_buf.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity()).sum::<usize>(),
+            self.meta_bin_buf.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity()).sum::<usize>(),
+        );
+        //currently, src bin contains all we need
+        // for bin in self.src_bins.iter_mut() {
+        //     assert_eq!(bin.0.len(), 0);
+        //     bin.0.shrink_to_fit();
+        //     assert_eq!(bin.1.len(), 0);
+        //     bin.1.shrink_to_fit();
+        //     assert_eq!(bin.2.len(), 0);
+        //     bin.2.shrink_to_fit();
+        //     assert_eq!(bin.3.len(), 0);
+        //     bin.3.shrink_to_fit();
+        //     assert_eq!(bin.4.len(), 0);
+        //     bin.4.shrink_to_fit();
+        // }
+        for bin in self.dst_bins.iter_mut() {
+            assert_eq!(bin.0.len(), 0);
+            bin.0.shrink_to_fit();
+            assert_eq!(bin.1.len(), 0);
+            bin.1.shrink_to_fit();
+            assert_eq!(bin.2.len(), 0);
+            bin.2.shrink_to_fit();
+            assert_eq!(bin.3.len(), 0);
+            bin.3.shrink_to_fit();
+            assert_eq!(bin.4.len(), 0);
+            bin.4.shrink_to_fit();
+        }
+        for bin in self.data_bin_buf.iter_mut() {
+            bin.0.truncate(0);
+            bin.0.shrink_to_fit();
+            bin.1.truncate(0);
+            bin.1.shrink_to_fit();
+            bin.2.truncate(0);
+            bin.2.shrink_to_fit();
+        }
+        for bin in self.data_bin_buf.iter_mut() {
+            bin.0.truncate(0);
+            bin.0.shrink_to_fit();
+            bin.1.truncate(0);
+            bin.1.shrink_to_fit();
+            bin.2.truncate(0);
+            bin.2.shrink_to_fit();
+        }
+        self.data_bin_file_idx.clear();
+        self.meta_bin_file_idx.clear();
+
+        //delete shuffle files
+        {
+            //read from disk
+            let path = Path::new("./");
+            for entry in fs::read_dir(path).expect("reading directory fails") {
+                if let Ok(entry) = entry {
+                    let file = entry.path();
+                    let filename = file.to_str().unwrap();
+
+                    if filename.contains("shuffle_")
+                        && !filename.contains("nonce")
+                        && !filename.contains("src")
+                    {
+                        remove_file(file).unwrap();
+                    }
+                }
+            }
         }
     }
 
     pub fn pull_buckets(&mut self, b_idx: usize, e_idx: usize, data: &mut [u8], meta: &mut [u8]) {
+        let storage = unsafe {
+            core::mem::transmute::<_, *mut UntrustedAllocation>(self.storage_id)
+                .as_mut()
+                .unwrap()
+        };
+
         let data_size = data.len();
         let meta_size = meta.len();
         assert_eq!(data_size / self.data_size, meta_size / self.meta_size);
         let data_item_size = self.data_size;
         let meta_item_size = self.meta_size;
-        let count_in_mem = self.count_in_mem;
+        let count_in_mem = storage.count_in_mem;
 
         //since data and meta is not loaded into memory, we read them directly from disk
         for (count, idx) in (b_idx..e_idx).into_iter().enumerate() {
-            let p = get_sts_ptr(&self.ptrs, idx).2;
-            if idx < self.count_in_mem {
-                self.data_bucket_file
+            let p = get_sts_ptr(&storage.ptrs, idx).2;
+            if idx < count_in_mem {
+                storage
+                    .data_file
                     .read_exact_at(
                         &mut data[data_item_size * count..data_item_size * (count + 1)],
                         (data_item_size * (idx * 2 + p)) as u64,
                     )
                     .unwrap();
             } else {
-                self.data_bucket_file
+                storage
+                    .data_file
                     .read_exact_at(
                         &mut data[data_item_size * count..data_item_size * (count + 1)],
                         (data_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
@@ -133,16 +200,18 @@ impl ShuffleManager {
         }
 
         for (count, idx) in (b_idx..e_idx).into_iter().enumerate() {
-            let p = get_sts_ptr(&self.ptrs, idx).2;
-            if idx < self.count_in_mem {
-                self.meta_bucket_file
+            let p = get_sts_ptr(&storage.ptrs, idx).2;
+            if idx < count_in_mem {
+                storage
+                    .meta_file
                     .read_exact_at(
                         &mut meta[meta_item_size * count..meta_item_size * (count + 1)],
                         (meta_item_size * (idx * 2 + p)) as u64,
                     )
                     .unwrap();
             } else {
-                self.meta_bucket_file
+                storage
+                    .meta_file
                     .read_exact_at(
                         &mut meta[meta_item_size * count..meta_item_size * (count + 1)],
                         (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
@@ -164,7 +233,7 @@ impl ShuffleManager {
         has_random_key: bool,
         nonce_size: usize,
         hash_size: usize,
-    ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    ) {
         assert!(cur_bin_num < self.num_bins);
         let mut nonce = vec![0; nonce_size];
         let mut hash = vec![0; hash_size];
@@ -190,7 +259,7 @@ impl ShuffleManager {
                         .unwrap();
                     offset += nonce_size as u64;
                     self.data_bin_file.read_exact_at(&mut hash, offset).unwrap();
-                    return (data, Vec::new(), Vec::new(), nonce, hash);
+                    self.tmp_buf = (data, Vec::new(), Vec::new(), nonce, hash);
                 } else {
                     let mut offset = self.meta_bin_file_idx[cur_bin_num];
                     let mut meta_size_buf = [0u8; 8];
@@ -208,7 +277,7 @@ impl ShuffleManager {
                         .unwrap();
                     offset += nonce_size as u64;
                     self.meta_bin_file.read_exact_at(&mut hash, offset).unwrap();
-                    return (Vec::new(), meta, Vec::new(), nonce, hash);
+                    self.tmp_buf = (Vec::new(), meta, Vec::new(), nonce, hash);
                 }
             } else {
                 if has_data {
@@ -216,13 +285,13 @@ impl ShuffleManager {
                         std::mem::take(&mut self.data_bin_buf[cur_bin_num - self.num_bins_on_disk]);
                     let actual_data_size = data.len();
                     *bin_size = actual_data_size / data_item_size;
-                    return (data, Vec::new(), Vec::new(), nonce, hash);
+                    self.tmp_buf = (data, Vec::new(), Vec::new(), nonce, hash);
                 } else {
                     let (meta, nonce, hash) =
                         std::mem::take(&mut self.meta_bin_buf[cur_bin_num - self.num_bins_on_disk]);
                     let actual_meta_size = meta.len();
                     *bin_size = actual_meta_size / meta_item_size;
-                    return (Vec::new(), meta, Vec::new(), nonce, hash);
+                    self.tmp_buf = (Vec::new(), meta, Vec::new(), nonce, hash);
                 }
             }
         } else if bin_type == 1 {
@@ -265,61 +334,86 @@ impl ShuffleManager {
                 self.src_bin_file.read_exact_at(&mut nonce, offset).unwrap();
                 offset += nonce_size as u64;
                 self.src_bin_file.read_exact_at(&mut hash, offset).unwrap();
-                return (data, meta, random_keys, nonce, hash);
+                self.tmp_buf = (data, meta, random_keys, nonce, hash);
             } else {
                 let t = std::mem::take(&mut self.src_bins[cur_bin_num - self.num_bins_on_disk]);
                 *bin_size = t.1.len() / meta_item_size;
-                return t;
+                self.tmp_buf = t;
             }
         } else {
             unreachable!()
         }
     }
 
-    pub fn push_buckets(&mut self, b_idx: usize, e_idx: usize, data: &[u8], meta: &[u8]) {
+    pub fn push_buckets(&mut self, b_idx: usize, e_idx: usize) {
+        let storage = unsafe {
+            core::mem::transmute::<_, *mut UntrustedAllocation>(self.storage_id)
+                .as_mut()
+                .unwrap()
+        };
+
+        let (data, meta, _, _, _) = std::mem::take(&mut self.tmp_buf);
         let data_size = data.len();
         let meta_size = meta.len();
         assert_eq!(data_size / self.data_size, meta_size / self.meta_size);
         let data_item_size = self.data_size;
         let meta_item_size = self.meta_size;
-        let count_in_mem = self.count_in_mem;
+        let count_in_mem = storage.count_in_mem;
+        let data_mut = unsafe {
+            core::slice::from_raw_parts_mut(storage.data_pointer, 2 * count_in_mem * data_item_size)
+        };
+        let meta_mut = unsafe {
+            core::slice::from_raw_parts_mut(storage.meta_pointer, 2 * count_in_mem * meta_item_size)
+        };
+
         for (count, idx) in (b_idx..e_idx).into_iter().enumerate() {
-            let (sts_on_disk, _, mut p) = get_sts_ptr(&self.ptrs, idx);
+            let (sts_on_disk, _, mut p) = get_sts_ptr(&storage.ptrs, idx);
             //every bucket write once
             assert!(!sts_on_disk);
-            if idx < self.count_in_mem {
+            if idx < count_in_mem {
                 p = p ^ 1;
-                self.data_bucket_file
-                    .write_all_at(
-                        &data[data_item_size * count..data_item_size * (count + 1)],
-                        (data_item_size * (idx * 2 + p)) as u64,
-                    )
-                    .unwrap();
+                (&mut data_mut[data_item_size * (idx * 2 + p)..data_item_size * (idx * 2 + p + 1)])
+                    .copy_from_slice(&data[data_item_size * count..data_item_size * (count + 1)]);
+                // storage
+                //     .data_file
+                //     .write_all_at(
+                //         &data[data_item_size * count..data_item_size * (count + 1)],
+                //         (data_item_size * (idx * 2 + p)) as u64,
+                //     )
+                //     .unwrap();
             } else {
                 p = (p + 1) % 3;
-                self.data_bucket_file
+                storage
+                    .data_file
                     .write_all_at(
                         &data[data_item_size * count..data_item_size * (count + 1)],
                         (data_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
                     )
                     .unwrap();
             }
-            set_ptr(&mut self.ptrs, idx, p);
+            set_ptr(&mut storage.ptrs, idx, p);
         }
 
         for (count, idx) in (b_idx..e_idx).into_iter().enumerate() {
-            let (sts_on_disk, _, p) = get_sts_ptr(&self.ptrs, idx);
+            let (sts_on_disk, _, p) = get_sts_ptr(&storage.ptrs, idx);
             //already set above
             assert!(sts_on_disk);
-            if idx < self.count_in_mem {
-                self.meta_bucket_file
-                    .write_all_at(
-                        &meta[meta_item_size * count..meta_item_size * (count + 1)],
-                        (meta_item_size * (idx * 2 + p)) as u64,
-                    )
-                    .unwrap();
+            if idx < count_in_mem {
+                (&mut meta_mut[meta_item_size * (idx * 2 + p)..meta_item_size * (idx * 2 + p + 1)])
+                    .clone_from_slice(&meta[meta_item_size * count..meta_item_size * (count + 1)]);
+                (&mut meta_mut[meta_item_size * (idx * 2 + (p ^ 1))
+                    ..meta_item_size * (idx * 2 + (p ^ 1) + 1)])
+                    .copy_from_slice(&vec![0; meta_item_size]);
+                // storage
+                //     .meta_file
+                //     .write_all_at(
+                //         &meta[meta_item_size * count..meta_item_size * (count + 1)],
+                //         (meta_item_size * (idx * 2 + p)) as u64,
+                //     )
+                //     .unwrap();
             } else {
-                self.meta_bucket_file
+                storage
+                    .meta_file
                     .write_all_at(
                         &meta[meta_item_size * count..meta_item_size * (count + 1)],
                         (meta_item_size * (count_in_mem * 2 + (idx - count_in_mem) * 3 + p)) as u64,
@@ -329,17 +423,9 @@ impl ShuffleManager {
         }
     }
 
-    pub fn push_bin(
-        &mut self,
-        cur_bin_num: usize,
-        bin_type: u8,
-        data: &[u8],
-        meta: &[u8],
-        random_key: &[u8],
-        nonce: &[u8],
-        hash: &[u8],
-    ) {
+    pub fn push_bin(&mut self, cur_bin_num: usize, bin_type: u8) {
         assert!(cur_bin_num < self.num_bins);
+        let (data, meta, random_key, nonce, hash) = std::mem::take(&mut self.tmp_buf);
         let data_size = data.len();
         let meta_size = meta.len();
         let random_key_size = random_key.len();
@@ -356,9 +442,9 @@ impl ShuffleManager {
                     self.data_bin_file
                         .write_all(&(data_size).to_le_bytes())
                         .unwrap();
-                    self.data_bin_file.write_all(data).unwrap();
-                    self.data_bin_file.write_all(nonce).unwrap();
-                    self.data_bin_file.write_all(hash).unwrap();
+                    self.data_bin_file.write_all(&data).unwrap();
+                    self.data_bin_file.write_all(&nonce).unwrap();
+                    self.data_bin_file.write_all(&hash).unwrap();
                 } else {
                     if self.meta_bin_file_idx[cur_bin_num] == u64::MAX {
                         self.meta_bin_file_idx[cur_bin_num] =
@@ -367,17 +453,15 @@ impl ShuffleManager {
                     self.meta_bin_file
                         .write_all(&(meta_size).to_le_bytes())
                         .unwrap();
-                    self.meta_bin_file.write_all(meta).unwrap();
-                    self.meta_bin_file.write_all(nonce).unwrap();
-                    self.meta_bin_file.write_all(hash).unwrap();
+                    self.meta_bin_file.write_all(&meta).unwrap();
+                    self.meta_bin_file.write_all(&nonce).unwrap();
+                    self.meta_bin_file.write_all(&hash).unwrap();
                 }
             } else {
                 if data_size > 0 {
-                    self.data_bin_buf[cur_bin_num - self.num_bins_on_disk] =
-                        (data.to_vec(), nonce.to_vec(), hash.to_vec());
+                    self.data_bin_buf[cur_bin_num - self.num_bins_on_disk] = (data, nonce, hash);
                 } else {
-                    self.meta_bin_buf[cur_bin_num - self.num_bins_on_disk] =
-                        (meta.to_vec(), nonce.to_vec(), hash.to_vec());
+                    self.meta_bin_buf[cur_bin_num - self.num_bins_on_disk] = (meta, nonce, hash);
                 }
             }
         } else if bin_type == 1 {
@@ -395,19 +479,14 @@ impl ShuffleManager {
                 self.dst_bin_file
                     .write_all(&(random_key_size).to_le_bytes())
                     .unwrap();
-                self.dst_bin_file.write_all(data).unwrap();
-                self.dst_bin_file.write_all(meta).unwrap();
-                self.dst_bin_file.write_all(random_key).unwrap();
-                self.dst_bin_file.write_all(nonce).unwrap();
-                self.dst_bin_file.write_all(hash).unwrap();
+                self.dst_bin_file.write_all(&data).unwrap();
+                self.dst_bin_file.write_all(&meta).unwrap();
+                self.dst_bin_file.write_all(&random_key).unwrap();
+                self.dst_bin_file.write_all(&nonce).unwrap();
+                self.dst_bin_file.write_all(&hash).unwrap();
             } else {
-                self.dst_bins[cur_bin_num - self.num_bins_on_disk] = (
-                    data.to_vec(),
-                    meta.to_vec(),
-                    random_key.to_vec(),
-                    nonce.to_vec(),
-                    hash.to_vec(),
-                );
+                self.dst_bins[cur_bin_num - self.num_bins_on_disk] =
+                    (data, meta, random_key, nonce, hash);
             }
         } else {
             unreachable!()
@@ -415,21 +494,26 @@ impl ShuffleManager {
     }
 
     pub fn bin_switch(&mut self, begin_bin_idx: usize, end_bin_idx: usize) {
+        assert_eq!(end_bin_idx - begin_bin_idx, self.num_bins);
         //reset file pointer
+        rename("shuffle_src_bin", "shuffle_src_bin_del").unwrap();
+        rename("shuffle_dst_bin", "shuffle_src_bin").unwrap();
+        std::mem::swap(&mut self.src_bin_file, &mut self.dst_bin_file);
+        self.src_bin_file_idx = std::mem::take(&mut self.dst_bin_file_idx);
+        self.dst_bin_file_idx = vec![u64::MAX; self.num_bins_on_disk];
+        self.dst_bin_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&"shuffle_dst_bin")
+            .unwrap();
         self.src_bin_file.seek(SeekFrom::Start(0)).unwrap();
-        self.dst_bin_file.seek(SeekFrom::Start(0)).unwrap();
-        //TODO: the size of bins from src and dst may not be equal
-        //but currently, this implementation works
-        if end_bin_idx - begin_bin_idx == self.num_bins {
-            std::mem::swap(&mut self.src_bin_file, &mut self.dst_bin_file);
-            std::mem::swap(&mut self.src_bin_file_idx, &mut self.dst_bin_file_idx);
-        }
+        remove_file("shuffle_src_bin_del").unwrap();
+
         for idx in begin_bin_idx..end_bin_idx {
             if idx >= self.num_bins_on_disk {
-                std::mem::swap(
-                    &mut self.src_bins[idx - self.num_bins_on_disk],
-                    &mut self.dst_bins[idx - self.num_bins_on_disk],
-                );
+                self.src_bins[idx - self.num_bins_on_disk] =
+                    std::mem::take(&mut self.dst_bins[idx - self.num_bins_on_disk]);
             }
         }
     }

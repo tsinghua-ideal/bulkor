@@ -206,15 +206,15 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
 
     //load the unfinished queries since the loaded snapshot id
     //TODO: if new_pos is logged and !is_latest, the new_pos should be ignored
-    let log_pos = ID_TO_LOG_POS
+    let mut log_pos = ID_TO_LOG_POS
         .lock()
         .unwrap()
         .remove(&snapshot_id)
         .unwrap_or(0);
     println!("log_len = {:?}, log_pos = {:?}", log_len, log_pos);
-    let queries_buf_cap = (log_len - log_pos) as usize;
-    println!("queries_buf_cap = {:?}", queries_buf_cap);
-    let mut queries_buf = vec![0; queries_buf_cap];
+    //let queries_buf_cap = (log_len - log_pos) as usize;
+    //println!("queries_buf_cap = {:?}", queries_buf_cap);
+    //let mut queries_buf = vec![0; queries_buf_cap];
     log.as_mut().map(|l| {
         if snapshot_id != 0 {
             l.seek(SeekFrom::Start(log_pos - 8)).unwrap();
@@ -225,47 +225,54 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
             l.seek(SeekFrom::Start(0)).unwrap();
             assert_eq!(log_pos, 0);
         }
-        l.read_exact(&mut queries_buf).unwrap();
+        //l.read_exact(&mut queries_buf).unwrap();
     });
-    assert_eq!(queries_buf_cap, queries_buf.len());
+    //assert_eq!(queries_buf_cap, queries_buf.len());
 
     ALLOCATOR.set_switch(true);
     let mut results = vec![];
     ALLOCATOR.set_switch(false);
 
-    //begin to replay the queries
-    let mut cur_q = 0;
-    while cur_q < queries_buf.len() {
-        //read batch size
-        let mut batch_size_buf = [0; 8];
-        batch_size_buf.copy_from_slice(&queries_buf[cur_q..(cur_q + 8)]);
-        let batch_size = u64::from_le_bytes(batch_size_buf) as usize;
-        cur_q += 8 + batch_size * QUERY_SIZE;
-        //read lifetime id
-        let mut lifetime_id_buf = [0; 8];
-        lifetime_id_buf.copy_from_slice(&queries_buf[cur_q..(cur_q + 8)]);
-        if u64::from_le_bytes(lifetime_id_buf) < lifetime_id {
-            //TODO: ignore the recorded pos
-        }
-        //process batch
-        let mut answers = vec![0; batch_size * ANSWER_SIZE];
-        process_batch(
-            &mut new_oram,
-            &queries_buf[(cur_q - batch_size * QUERY_SIZE)..cur_q],
-            &mut answers,
-        );
-        cur_q += 8;
-        // no need to store QUERY_CNT, since it has the newest cnt
-        // let mut query_cnt_buf = [0; 8];
-        // query_cnt_buf.copy_from_slice(&queries_buf[cur_q..(cur_q + 8)]);
-        // QUERY_CNT.store(u64::from_le_bytes(query_cnt_buf), Ordering::SeqCst);
-        cur_q += 8;
+    log.as_mut().map(|l| {
+        //begin to replay the queries
+        while log_pos < log_len {
+            //read batch size
+            let mut batch_size_buf = [0; 8];
+            l.read_exact(&mut batch_size_buf).unwrap();
+            let batch_size = u64::from_le_bytes(batch_size_buf) as usize;
+            log_pos += 8;
 
-        //send results back
-        ALLOCATOR.set_switch(true);
-        results.extend_from_slice(&answers);
-        ALLOCATOR.set_switch(false);
-    }
+            let mut queries_buf = vec![0; batch_size * QUERY_SIZE];
+            l.read_exact(&mut queries_buf).unwrap();
+            log_pos += queries_buf.len() as u64;
+
+            //read lifetime id
+            let mut lifetime_id_buf = [0; 8];
+            l.read_exact(&mut lifetime_id_buf).unwrap();
+            if u64::from_le_bytes(lifetime_id_buf) < lifetime_id {
+                //TODO: ignore the recorded pos
+            }
+            log_pos += 8;
+
+            //process batch
+            let mut answers = vec![0; batch_size * ANSWER_SIZE];
+            process_batch(&mut new_oram, &queries_buf, &mut answers);
+
+            // do not need to store QUERY_CNT, since it already has the newest cnt
+            // however, we should seek forward
+            // let mut query_cnt_buf = [0; 8];
+            // l.read_exact(&mut query_cnt_buf).unwrap();
+            // QUERY_CNT.store(u64::from_le_bytes(query_cnt_buf), Ordering::SeqCst);
+            let actual_log_pos = l.seek(SeekFrom::Current(8)).unwrap();
+            log_pos += 8;
+            assert_eq!(log_pos, actual_log_pos);
+
+            //send results back
+            ALLOCATOR.set_switch(true);
+            results.extend_from_slice(&answers);
+            ALLOCATOR.set_switch(false);
+        }
+    });
 
     ALLOCATOR.set_switch(true);
     let ptr = Box::into_raw(Box::new(results)) as usize;
