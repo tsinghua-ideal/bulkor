@@ -33,11 +33,6 @@ pub struct ShuffleManager {
 
 impl ShuffleManager {
     pub fn new(storage_id: u64, data_size: usize, meta_size: usize, num_bins: usize) -> Self {
-        //temporarily set
-        //in this setting, the second half are placed in memory, while the first half are placed on disk
-        //it is easy to handle bin switch, because for cur_num_bins <= num_bins/2, the bins we are
-        //processing is exactly in memory.
-        //TODO: We need to deal with the case while num_bins_on_disk > num_bins/2
         let num_bins_on_disk = num_bins / 2;
 
         let data_bin_file_name = PathBuf::from("shuffle_data_bin");
@@ -93,74 +88,12 @@ impl ShuffleManager {
     }
 
     pub fn clear_content(&mut self) {
-        println!("manager.src_bins.cap = {:?}, manager.dst_bins.cap = {:?}, manager.data_bins.cap = {:?}, manager.meta_bins.cap = {:?}",  
-            self.src_bins.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity() + x.3.capacity() + x.4.capacity()).sum::<usize>(),
-            self.dst_bins.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity() + x.3.capacity() + x.4.capacity()).sum::<usize>(),
-            self.data_bin_buf.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity()).sum::<usize>(),
-            self.meta_bin_buf.iter().map(|x| x.0.capacity() + x.1.capacity() + x.2.capacity()).sum::<usize>(),
-        );
-        //currently, src bin contains all we need
-        // for bin in self.src_bins.iter_mut() {
-        //     assert_eq!(bin.0.len(), 0);
-        //     bin.0.shrink_to_fit();
-        //     assert_eq!(bin.1.len(), 0);
-        //     bin.1.shrink_to_fit();
-        //     assert_eq!(bin.2.len(), 0);
-        //     bin.2.shrink_to_fit();
-        //     assert_eq!(bin.3.len(), 0);
-        //     bin.3.shrink_to_fit();
-        //     assert_eq!(bin.4.len(), 0);
-        //     bin.4.shrink_to_fit();
-        // }
-        for bin in self.dst_bins.iter_mut() {
-            assert_eq!(bin.0.len(), 0);
-            bin.0.shrink_to_fit();
-            assert_eq!(bin.1.len(), 0);
-            bin.1.shrink_to_fit();
-            assert_eq!(bin.2.len(), 0);
-            bin.2.shrink_to_fit();
-            assert_eq!(bin.3.len(), 0);
-            bin.3.shrink_to_fit();
-            assert_eq!(bin.4.len(), 0);
-            bin.4.shrink_to_fit();
-        }
-        for bin in self.data_bin_buf.iter_mut() {
-            bin.0.truncate(0);
-            bin.0.shrink_to_fit();
-            bin.1.truncate(0);
-            bin.1.shrink_to_fit();
-            bin.2.truncate(0);
-            bin.2.shrink_to_fit();
-        }
-        for bin in self.data_bin_buf.iter_mut() {
-            bin.0.truncate(0);
-            bin.0.shrink_to_fit();
-            bin.1.truncate(0);
-            bin.1.shrink_to_fit();
-            bin.2.truncate(0);
-            bin.2.shrink_to_fit();
-        }
+        //sometimes the user-space allocator would not return the memory to OS, causing the memory overflow.
+        let release_mem = unsafe { libc::malloc_trim(0) };
+        println!("release the memory successfully? {:?}", release_mem == 1);
+
         self.data_bin_file_idx.clear();
         self.meta_bin_file_idx.clear();
-
-        //delete shuffle files
-        {
-            //read from disk
-            let path = Path::new("./");
-            for entry in fs::read_dir(path).expect("reading directory fails") {
-                if let Ok(entry) = entry {
-                    let file = entry.path();
-                    let filename = file.to_str().unwrap();
-
-                    if filename.contains("shuffle_")
-                        && !filename.contains("nonce")
-                        && !filename.contains("src")
-                    {
-                        remove_file(file).unwrap();
-                    }
-                }
-            }
-        }
     }
 
     pub fn pull_buckets(&mut self, b_idx: usize, e_idx: usize, data: &mut [u8], meta: &mut [u8]) {
@@ -433,7 +366,6 @@ impl ShuffleManager {
             assert_eq!(random_key_size, 0);
             assert!(meta_size == 0 && data_size > 0 || meta_size > 0 && data_size == 0);
             if cur_bin_num < self.num_bins_on_disk {
-                //println!("cur_num_bins must be equal to num_bins");
                 if data_size > 0 {
                     if self.data_bin_file_idx[cur_bin_num] == u64::MAX {
                         self.data_bin_file_idx[cur_bin_num] =

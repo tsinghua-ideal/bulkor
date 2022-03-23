@@ -609,10 +609,27 @@ pub extern "C" fn build_oram_from_shuffle_manager(
 ) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     SHUFFLE_MANAGER_ID.store(0, Ordering::SeqCst);
-    let mut manager =
+    let manager =
         unsafe { Box::from_raw(core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id)) };
     //release the space,
     drop(manager);
+    //delete shuffle files
+    {
+        //read from disk
+        let path = Path::new("./");
+        for entry in fs::read_dir(path).expect("reading directory fails") {
+            if let Ok(entry) = entry {
+                let file = entry.path();
+                let filename = file.to_str().unwrap();
+
+                if filename.contains("shuffle_") && !filename.contains("nonce") {
+                    remove_file(file).unwrap();
+                }
+            }
+        }
+    }
+    let _release_mem = unsafe { libc::malloc_trim(0) };
+
     //TODO: may need lock for manager, but no need for storage, because the storage id is removed
     let storage = unsafe {
         core::mem::transmute::<_, *mut UntrustedAllocation>(allocation_id)
