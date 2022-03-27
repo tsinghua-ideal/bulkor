@@ -77,9 +77,9 @@ use test_helper::get_seeded_rng;
 static ALLOCATOR: Allocator = Allocator;
 
 /// First level persistence: every 10 log batches
-const FL_PERSIST_SIZE: u64 = 5;
+const FL_PERSIST_SIZE: u64 = 16 << 10;
 /// Second level persistence: every 100 log batches
-const SL_PERSIST_SIZE: u64 = 10;
+const SL_PERSIST_SIZE: u64 = 16 << 10;
 
 /// Cipher type. Anything implementing StreamCipher and NewCipher at 128
 /// bit security should be acceptable
@@ -324,7 +324,7 @@ pub extern "C" fn ecall_access(
     let mut cur_query_cnt = QUERY_CNT.load(Ordering::SeqCst);
     cur_query_cnt += batch_size as u64;
     QUERY_CNT.store(cur_query_cnt, Ordering::SeqCst);
-    println!("cur_query_cnt = {:?}", cur_query_cnt);
+    //println!("cur_query_cnt = {:?}", cur_query_cnt);
     let lifetime_id = LIFETIME_ID.load(Ordering::SeqCst);
     //TODO: get timestamp and log timestamp
     let cur_log_pos = {

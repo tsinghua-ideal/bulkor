@@ -1,7 +1,8 @@
 use crate::storage_ocalls::{get_sts_ptr, set_ptr, UntrustedAllocation};
+use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use std::fs::{self, remove_file, rename, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::{fs::FileExt, io::AsRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 pub struct ShuffleManager {
@@ -33,7 +34,7 @@ pub struct ShuffleManager {
 
 impl ShuffleManager {
     pub fn new(storage_id: u64, data_size: usize, meta_size: usize, num_bins: usize) -> Self {
-        let num_bins_on_disk = num_bins / 2;
+        let num_bins_on_disk = num_bins - num_bins / 1;
 
         let data_bin_file_name = PathBuf::from("shuffle_data_bin");
         let meta_bin_file_name = PathBuf::from("shuffle_meta_bin");
@@ -152,6 +153,20 @@ impl ShuffleManager {
                     .unwrap();
             }
         }
+        posix_fadvise(
+            storage.data_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            storage.meta_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
     }
 
     pub fn pull_bin(
@@ -276,6 +291,27 @@ impl ShuffleManager {
         } else {
             unreachable!()
         }
+        posix_fadvise(
+            self.src_bin_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            self.data_bin_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            self.meta_bin_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
     }
 
     pub fn push_buckets(&mut self, b_idx: usize, e_idx: usize) {
@@ -354,6 +390,22 @@ impl ShuffleManager {
                     .unwrap();
             }
         }
+        storage.data_file.sync_all().unwrap();
+        storage.meta_file.sync_all().unwrap();
+        posix_fadvise(
+            storage.data_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            storage.meta_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
     }
 
     pub fn push_bin(&mut self, cur_bin_num: usize, bin_type: u8) {
@@ -423,6 +475,30 @@ impl ShuffleManager {
         } else {
             unreachable!()
         }
+        self.dst_bin_file.sync_all().unwrap();
+        self.data_bin_file.sync_all().unwrap();
+        self.meta_bin_file.sync_all().unwrap();
+        posix_fadvise(
+            self.dst_bin_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            self.data_bin_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            self.meta_bin_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
     }
 
     pub fn bin_switch(&mut self, begin_bin_idx: usize, end_bin_idx: usize) {
