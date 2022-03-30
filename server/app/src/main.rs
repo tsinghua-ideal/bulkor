@@ -26,7 +26,7 @@ use sgx_urts::SgxEnclave;
 extern crate lazy_static;
 use aes::{cipher::NewCipher, Aes128Ctr};
 use aligned_cmov::{
-    typenum::{Unsigned, U1024},
+    typenum::{Unsigned, U1024, U64},
     A64Bytes,
 };
 use rand_core::{CryptoRng, RngCore, SeedableRng};

@@ -49,7 +49,7 @@ use aes::{
 };
 use aes_gcm::Aes128Gcm;
 use aligned_cmov::{
-    typenum::{Unsigned, U1024, U12, U24, U4, U4096, U96},
+    typenum::{Unsigned, U1024, U12, U24, U256, U4, U4096, U64, U96},
     CMov,
 };
 
@@ -59,7 +59,7 @@ mod custom_counter;
 use custom_counter::check_counter;
 use sgx_types::sgx_status_t;
 mod oram_manager;
-use oram_manager::{PathORAM, PathORAM4096Z4Creator, POS_MAP_THRESHOLD};
+use oram_manager::{PathORAM, PathORAM256Z4Creator, PathORAM4096Z4Creator, POS_MAP_THRESHOLD};
 mod oram_storage;
 use oram_storage::{
     get_valid_snapshot_id, s_decrypt, s_encrypt_with_nonce, OcallORAMStorage,

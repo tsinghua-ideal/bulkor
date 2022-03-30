@@ -22,7 +22,7 @@
 
 use crate::oram_storage::OcallORAMStorageCreator;
 use crate::oram_traits::{ORAMCreator, ORAMStorageCreator, PositionMap};
-use aligned_cmov::typenum::{Prod, U1024, U16, U2, U2048, U24, U32, U4, U4096};
+use aligned_cmov::typenum::{Prod, U1024, U16, U2, U2048, U24, U256, U4, U4096, U64};
 use rand_core::{CryptoRng, RngCore};
 use std::marker::PhantomData;
 
@@ -152,6 +152,62 @@ where
         rng_maker: &mut M,
     ) -> Self::Output {
         PathORAM::new::<U32PositionMapCreator<U1024, R, Self>, SC, M>(size, stash_size, rng_maker)
+    }
+}
+
+/// Creator for PathORAM based on 256-sized blocks of storage and bucket size
+/// (Z) of 4, and a basic recursive position map implementation
+pub struct PathORAM256Z4Creator<R, SC>
+where
+    R: RngCore + CryptoRng + 'static,
+    SC: ORAMStorageCreator<U256, Prod<U4, DataMetaSize>, U4>,
+{
+    _rng: PhantomData<fn() -> R>,
+    _sc: PhantomData<fn() -> SC>,
+}
+
+impl<R, SC> ORAMCreator<U64, R> for PathORAM256Z4Creator<R, SC>
+where
+    R: RngCore + CryptoRng + Send + Sync + 'static,
+    SC: ORAMStorageCreator<U256, Prod<U4, DataMetaSize>, U4>,
+{
+    type Output = PathORAM<U64, DataMetaSize, U4, SC::Output, R>;
+
+    fn create<M: 'static + FnMut() -> R>(
+        size: u64,
+        stash_size: usize,
+        rng_maker: &mut M,
+    ) -> Self::Output {
+        PathORAM::new::<
+            U32PositionMapCreator<U64, R, RecPathORAM256Z4Creator<R, OcallORAMStorageCreator>>,
+            SC,
+            M,
+        >(size, stash_size, rng_maker)
+    }
+}
+
+pub struct RecPathORAM256Z4Creator<R, SC>
+where
+    R: RngCore + CryptoRng + 'static,
+    SC: ORAMStorageCreator<U256, Prod<U4, PosMetaSize>, U4>,
+{
+    _rng: PhantomData<fn() -> R>,
+    _sc: PhantomData<fn() -> SC>,
+}
+
+impl<R, SC> ORAMCreator<U64, R> for RecPathORAM256Z4Creator<R, SC>
+where
+    R: RngCore + CryptoRng + Send + Sync + 'static,
+    SC: ORAMStorageCreator<U256, Prod<U4, PosMetaSize>, U4>,
+{
+    type Output = PathORAM<U64, PosMetaSize, U4, SC::Output, R>;
+
+    fn create<M: 'static + FnMut() -> R>(
+        size: u64,
+        stash_size: usize,
+        rng_maker: &mut M,
+    ) -> Self::Output {
+        PathORAM::new::<U32PositionMapCreator<U64, R, Self>, SC, M>(size, stash_size, rng_maker)
     }
 }
 
