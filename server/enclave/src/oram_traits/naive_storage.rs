@@ -61,22 +61,22 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
 
             //check the integrity
             let loaded_snapshot_id =
-                u64::from_le_bytes((&data_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
+                u64::from_ne_bytes((&data_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
             assert_eq!(loaded_snapshot_id, snapshot_id);
             let loaded_level =
-                u32::from_le_bytes((&data_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
+                u32::from_ne_bytes((&data_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
             assert_eq!(loaded_level, level);
             let loaded_lifetime_id =
-                u64::from_le_bytes((&data_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
+                u64::from_ne_bytes((&data_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
             assert_eq!(loaded_lifetime_id, lifetime_id);
             let loaded_snapshot_id =
-                u64::from_le_bytes((&meta_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
+                u64::from_ne_bytes((&meta_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
             assert_eq!(loaded_snapshot_id, snapshot_id);
             let loaded_level =
-                u32::from_le_bytes((&meta_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
+                u32::from_ne_bytes((&meta_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
             assert_eq!(loaded_level, level);
             let loaded_lifetime_id =
-                u64::from_le_bytes((&meta_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
+                u64::from_ne_bytes((&meta_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
             assert_eq!(loaded_lifetime_id, lifetime_id);
 
             let iter_data = (&data_buf[(ns + 36)..]).chunks_exact(BlockSize::USIZE);
@@ -161,17 +161,17 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
         //TODO: This step can be in parallel with the following ones
         assert!(self.data.len() == self.metadata.len());
         let mut data = vec![0; NonceSize::USIZE + 16];
-        data.extend_from_slice(&new_snapshot_id.to_le_bytes());
-        data.extend_from_slice(&self.level.to_le_bytes());
-        data.extend_from_slice(&lifetime_id.to_le_bytes());
+        data.extend_from_slice(&new_snapshot_id.to_ne_bytes());
+        data.extend_from_slice(&self.level.to_ne_bytes());
+        data.extend_from_slice(&lifetime_id.to_ne_bytes());
         for d in &self.data {
             data.extend_from_slice(d);
         }
 
         let mut meta = vec![0; NonceSize::USIZE + 16];
-        meta.extend_from_slice(&new_snapshot_id.to_le_bytes());
-        meta.extend_from_slice(&self.level.to_le_bytes());
-        meta.extend_from_slice(&lifetime_id.to_le_bytes());
+        meta.extend_from_slice(&new_snapshot_id.to_ne_bytes());
+        meta.extend_from_slice(&self.level.to_ne_bytes());
+        meta.extend_from_slice(&lifetime_id.to_ne_bytes());
         for m in &self.metadata {
             meta.extend_from_slice(m);
         }
@@ -191,11 +191,6 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
                 volatile as u8,
             )
         }
-    }
-
-    fn get_shuffle_pos(&self, key: &u64) -> (u64, Choice) {
-        //since the treetop is always accessed through the outer storage
-        unreachable!()
     }
 }
 

@@ -104,9 +104,6 @@ pub trait ORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: 
         volatile: bool,
         rng: &mut Rng,
     );
-
-    // This it the API for get the pos after shuffle
-    fn get_shuffle_pos(&self, key: &u64) -> (u64, Choice);
 }
 
 /// An Oblivious RAM -- that is, an array like [A8Bytes<ValueSize>; N]

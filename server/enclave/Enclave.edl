@@ -83,9 +83,7 @@ enclave {
                                    uint64_t count,
                                    uint64_t data_size,
                                    uint64_t meta_size,
-                                   [out] uint64_t * id,
-                                   [out, count=shuffle_nonce_size] uint8_t * shuffle_nonce,
-                                   uint64_t shuffle_nonce_size);
+                                   [out] uint64_t * id);
 
         /// Prepare for global shuffle on ORAM indexed by allocation_id
         void allocate_shuffle_manager(uint64_t allocation_id, uint64_t z, size_t bin_size_in_block, [out] uint64_t * shuffle_id);
@@ -293,14 +291,25 @@ enclave {
             size_t cur_bin_num,
             uint8_t bin_type);
 
+        void shuffle_push_tmp_posmap(size_t data_size,
+            size_t nonce_size,
+            size_t hash_size,
+            [out] size_t * data_ptr,
+            [out] size_t * nonce_ptr,
+            [out] size_t * hash_ptr);
+
+        void shuffle_pull_tmp_posmap([out] size_t * data_ptr,
+            [out] size_t * nonce_ptr,
+            [out] size_t * hash_ptr);
+
+        void shuffle_release_tmp_posmap();
+
         void bin_switch(uint64_t shuffle_id, size_t begin_bin_idx, size_t end_bin_idx);
 
         void clear_content(uint64_t shuffle_id);
 
         void build_oram_from_shuffle_manager(uint64_t shuffle_id, 
-            uint64_t allocation_id, 
-            [in, count=shuffle_nonce_size] uint8_t * shuffle_nonce,
-            size_t shuffle_nonce_size);
+            uint64_t allocation_id);
     };
 
 };

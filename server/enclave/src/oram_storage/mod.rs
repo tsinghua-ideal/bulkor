@@ -31,7 +31,7 @@
 use std::cmp::max;
 use std::convert::TryInto;
 use std::marker::PhantomData;
-use std::ops::{Add, Div};
+use std::ops::{Add, Div, Mul};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::SgxMutex as Mutex;
 use std::vec::Vec;
@@ -40,7 +40,7 @@ use aes::cipher::{NewCipher, StreamCipher};
 use aes_gcm::aead::{Aead, NewAead};
 use aligned_cmov::{
     subtle::{Choice, ConstantTimeEq},
-    typenum::{PartialDiv, PowerOfTwo, Quot, Sum, Unsigned, U8},
+    typenum::{PartialDiv, PowerOfTwo, Prod, Quot, Sum, Unsigned, U8},
     A64Bytes, A8Bytes, ArrayLength, GenericArray,
 };
 use balanced_tree_index::TreeIndex;
@@ -56,7 +56,7 @@ use crate::{
 
 mod extra_meta;
 pub use extra_meta::{compute_block_hash, compute_slices_hash, ExtraMeta, ExtraMetaSize, Hash};
-mod shuffle_manager;
+pub mod shuffle_manager;
 use shuffle_manager::BIN_SIZE_IN_BLOCK;
 
 lazy_static! {
@@ -110,8 +110,8 @@ lazy_static! {
 // Make an aes nonce per the docu
 fn make_aes_nonce(block_idx: u64, block_ctr: u64) -> GenericArray<u8, NonceSize> {
     let mut result = GenericArray::<u8, NonceSize>::default();
-    result[0..8].copy_from_slice(&block_idx.to_le_bytes());
-    result[8..16].copy_from_slice(&block_ctr.to_le_bytes());
+    result[0..8].copy_from_slice(&block_idx.to_ne_bytes());
+    result[8..16].copy_from_slice(&block_ctr.to_ne_bytes());
     result
 }
 
@@ -177,11 +177,14 @@ pub fn s_decrypt(key: &GenericArray<u8, KeySize>, ct: &mut [u8], skip_enc: usize
 pub struct OcallORAMStorage<DataSize, MetaSize, Z>
 where
     DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z>,
-    Z: Unsigned,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Add<Prod<Z, U8>> + Div<Z>,
+    Z: Unsigned + Mul<U8>,
+    Prod<Z, U8>: Unsigned,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
     Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
-    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Add<U8> + Unsigned,
+    Sum<MetaSize, Prod<Z, U8>>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Sum<Quot<MetaSize, Z>, U8>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
     /// The current level of recursive ORAM
     level: u32,
@@ -206,19 +209,20 @@ where
     // The key we use when hashing ciphertexts to make merkle tree
     // Keeping this secret makes the hash functionally a mac
     hash_key: GenericArray<u8, KeySize>,
-    // shuffle_nonce
-    shuffle_nonce: GenericArray<u8, NonceSize>,
     _z: PhantomData<fn() -> Z>,
 }
 
 impl<DataSize, MetaSize, Z> OcallORAMStorage<DataSize, MetaSize, Z>
 where
     DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z>,
-    Z: Unsigned,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Add<Prod<Z, U8>> + Div<Z>,
+    Z: Unsigned + Mul<U8>,
+    Prod<Z, U8>: Unsigned,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
     Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
-    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Add<U8> + Unsigned,
+    Sum<MetaSize, Prod<Z, U8>>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Sum<Quot<MetaSize, Z>, U8>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
     /// Create a new oram storage object for count items, with particular RNG
     pub fn new<Rng: RngCore + CryptoRng>(level: u32, count: u64, rng: &mut Rng) -> Self {
@@ -249,16 +253,16 @@ where
                 s_decrypt(&ORAM_KEY, &mut roots_buf, 28);
                 //check the integrity
                 let loaded_snapshot_id =
-                    u64::from_le_bytes((&roots_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
+                    u64::from_ne_bytes((&roots_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
                 assert_eq!(loaded_snapshot_id, snapshot_id);
                 let loaded_level =
-                    u32::from_le_bytes((&roots_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
+                    u32::from_ne_bytes((&roots_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
                 assert_eq!(loaded_level, level);
                 let loaded_count =
-                    u64::from_le_bytes((&roots_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
+                    u64::from_ne_bytes((&roots_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
                 assert_eq!(loaded_count, count);
                 let loaded_lifetime_id =
-                    u64::from_le_bytes((&roots_buf[(ns + 36)..(ns + 44)]).try_into().unwrap());
+                    u64::from_ne_bytes((&roots_buf[(ns + 36)..(ns + 44)]).try_into().unwrap());
                 assert_eq!(loaded_lifetime_id, lifetime_id);
 
                 let iter_data = (&roots_buf[(ns + 44)..]).chunks_exact(16);
@@ -280,8 +284,6 @@ where
         };
         //recovery is included in allocation
         let mut allocation_id = 0u64;
-        //generate a random number for nonce of permutation, and it needs to be persisted
-        let mut shuffle_nonce = GenericArray::<u8, NonceSize>::default();
         unsafe {
             allocate_oram_storage(
                 level,
@@ -291,8 +293,6 @@ where
                 DataSize::U64,
                 MetaSize::U64 + ExtraMetaSize::U64,
                 &mut allocation_id,
-                shuffle_nonce.as_mut_ptr(),
-                NonceSize::U64,
             );
         }
         if allocation_id == 0 {
@@ -311,13 +311,14 @@ where
         // rng.fill_bytes(hash_key.as_mut_slice());
 
         //shuffle the oram tree if necessary
-        if snapshot_id > 0 && !is_latest && level == 0 {
+        if snapshot_id > 0 && !is_latest {
             let mut shuffle_id = 0;
             unsafe {
                 allocate_shuffle_manager(allocation_id, Z::U64, BIN_SIZE_IN_BLOCK, &mut shuffle_id);
             }
             //change the shuffle nonce
             manage(
+                level,
                 shuffle_id,
                 allocation_id,
                 count,
@@ -326,7 +327,6 @@ where
                 &mut trusted_merkle_roots,
                 &aes_key,
                 &hash_key,
-                &mut shuffle_nonce,
                 rng,
             );
         }
@@ -343,7 +343,6 @@ where
             meta_scratch_buffer: Default::default(),
             aes_key,
             hash_key,
-            shuffle_nonce,
             _z: Default::default(),
         }
     }
@@ -358,11 +357,14 @@ impl<DataSize, MetaSize, Z> ORAMStorage<DataSize, MetaSize, Z>
     for OcallORAMStorage<DataSize, MetaSize, Z>
 where
     DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z>,
-    Z: Unsigned,
+    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Add<Prod<Z, U8>> + Div<Z>,
+    Z: Unsigned + Mul<U8>,
+    Prod<Z, U8>: Unsigned,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8>,
     Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
-    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Add<U8> + Unsigned,
+    Sum<MetaSize, Prod<Z, U8>>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
+    Sum<Quot<MetaSize, Z>, U8>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
     fn len(&self) -> u64 {
         self.count
@@ -617,10 +619,10 @@ where
         //encrypt the merkle roots and send it out
         //TODO: This step can be in parallel with the following ones
         let mut roots = vec![0; NonceSize::USIZE + 16];
-        roots.extend_from_slice(&new_snapshot_id.to_le_bytes());
-        roots.extend_from_slice(&self.level.to_le_bytes());
-        roots.extend_from_slice(&self.count.to_le_bytes());
-        roots.extend_from_slice(&lifetime_id.to_le_bytes());
+        roots.extend_from_slice(&new_snapshot_id.to_ne_bytes());
+        roots.extend_from_slice(&self.level.to_ne_bytes());
+        roots.extend_from_slice(&self.count.to_ne_bytes());
+        roots.extend_from_slice(&lifetime_id.to_ne_bytes());
         for d in &self.trusted_merkle_roots {
             roots.extend_from_slice(d);
         }
@@ -638,20 +640,6 @@ where
             )
         }
     }
-
-    fn get_shuffle_pos(&self, key: &u64) -> (u64, Choice) {
-        let mut new_leaf_buf = key.to_le_bytes();
-        let mut cipher = CipherType::new(&self.aes_key, &self.shuffle_nonce);
-        cipher.apply_keystream(&mut new_leaf_buf);
-        let new_leaf =
-            (u64::from_le_bytes(new_leaf_buf) & ((self.count >> 1) - 1)) + (self.count >> 1);
-        (
-            new_leaf,
-            !self
-                .shuffle_nonce
-                .ct_eq(&GenericArray::<u8, NonceSize>::default()),
-        )
-    }
 }
 
 /// An ORAMStorageCreator for the Ocall-based storage type
@@ -660,11 +648,15 @@ pub struct OcallORAMStorageCreator;
 impl<DataSize, MetaSize, Z> ORAMStorageCreator<DataSize, MetaSize, Z> for OcallORAMStorageCreator
 where
     DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8> + Div<Z> + 'static,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Div<Z> + 'static,
+    MetaSize:
+        ArrayLength<u8> + PartialDiv<U8> + Add<ExtraMetaSize> + Add<Prod<Z, U8>> + Div<Z> + 'static,
     Sum<MetaSize, ExtraMetaSize>: ArrayLength<u8> + PartialDiv<U8> + 'static,
-    Z: Unsigned + 'static,
+    Z: Unsigned + Mul<U8> + 'static,
+    Prod<Z, U8>: Unsigned + 'static,
     Quot<DataSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned + 'static,
-    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Unsigned + 'static,
+    Quot<MetaSize, Z>: ArrayLength<u8> + PartialDiv<U8> + Add<U8> + Unsigned + 'static,
+    Sum<MetaSize, Prod<Z, U8>>: ArrayLength<u8> + PartialDiv<U8> + Unsigned + 'static,
+    Sum<Quot<MetaSize, Z>, U8>: ArrayLength<u8> + PartialDiv<U8> + Unsigned + 'static,
 {
     type Output = OcallORAMStorage<DataSize, MetaSize, Z>;
     type Error = UntrustedStorageError;
@@ -797,8 +789,6 @@ extern "C" {
         data_size: u64,
         meta_size: u64,
         id: *mut u64,
-        shuffle_nonce: *mut u8,
-        shuffle_nonce_size: u64,
     );
     fn allocate_shuffle_manager(
         allocation_id: u64,

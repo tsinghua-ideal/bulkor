@@ -37,7 +37,7 @@ where
     pub fn to_slice(&self, bytes: &mut [u8]) {
         let ms = NonceSize::USIZE + 16 + 8 + 8; //meta size
         bytes[ms] = self.op_type;
-        (&mut bytes[(ms + 1)..(ms + 9)]).copy_from_slice(&self.idx.to_le_bytes());
+        (&mut bytes[(ms + 1)..(ms + 9)]).copy_from_slice(&self.idx.to_ne_bytes());
         (&mut bytes[(ms + 9)..(ms + 9 + ValueSize::USIZE)]).copy_from_slice(&self.new_val);
     }
 }
@@ -47,7 +47,7 @@ pub fn extract_client_id(bytes: &[u8]) -> u64 {
     let pos = NonceSize::USIZE + 16;
     let mut client_id_buf = [0; 8];
     client_id_buf.copy_from_slice(&bytes[pos..(pos + 8)]);
-    u64::from_le_bytes(client_id_buf)
+    u64::from_ne_bytes(client_id_buf)
 }
 
 //stream cipher, reserve place for nonce and tag

@@ -5,7 +5,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 pub struct ShuffleManager {
-    storage_id: u64,
+    pub storage_id: u64,
     data_size: usize, //Bucket data
     meta_size: usize, //Bucket meta (not block meta) plus extra
     num_bins: usize,
@@ -182,7 +182,7 @@ impl ShuffleManager {
                         .read_exact_at(&mut data_size_buf, offset)
                         .unwrap();
                     offset += 8;
-                    let actual_data_size = usize::from_le_bytes(data_size_buf);
+                    let actual_data_size = usize::from_ne_bytes(data_size_buf);
                     *bin_size = actual_data_size / data_item_size;
                     let mut data = vec![0; actual_data_size];
                     self.data_bin_file.read_exact_at(&mut data, offset).unwrap();
@@ -200,7 +200,7 @@ impl ShuffleManager {
                         .read_exact_at(&mut meta_size_buf, offset)
                         .unwrap();
                     offset += 8;
-                    let actual_meta_size = usize::from_le_bytes(meta_size_buf);
+                    let actual_meta_size = usize::from_ne_bytes(meta_size_buf);
                     *bin_size = actual_meta_size / meta_item_size;
                     let mut meta = vec![0; actual_meta_size];
                     self.meta_bin_file.read_exact_at(&mut meta, offset).unwrap();
@@ -238,17 +238,17 @@ impl ShuffleManager {
                     .read_exact_at(&mut data_size_buf, offset)
                     .unwrap();
                 offset += 8;
-                let actual_data_size = usize::from_le_bytes(data_size_buf);
+                let actual_data_size = usize::from_ne_bytes(data_size_buf);
                 self.src_bin_file
                     .read_exact_at(&mut meta_size_buf, offset)
                     .unwrap();
                 offset += 8;
-                let actual_meta_size = usize::from_le_bytes(meta_size_buf);
+                let actual_meta_size = usize::from_ne_bytes(meta_size_buf);
                 self.src_bin_file
                     .read_exact_at(&mut random_key_size_buf, offset)
                     .unwrap();
                 offset += 8;
-                let actual_random_key_size = usize::from_le_bytes(random_key_size_buf);
+                let actual_random_key_size = usize::from_ne_bytes(random_key_size_buf);
                 *bin_size = actual_meta_size / meta_item_size;
                 assert!(has_data == (actual_data_size != 0));
                 assert!(has_meta == (actual_meta_size != 0));
@@ -372,7 +372,7 @@ impl ShuffleManager {
                             self.data_bin_file.seek(SeekFrom::End(0)).unwrap();
                     }
                     self.data_bin_file
-                        .write_all(&(data_size).to_le_bytes())
+                        .write_all(&(data_size).to_ne_bytes())
                         .unwrap();
                     self.data_bin_file.write_all(&data).unwrap();
                     self.data_bin_file.write_all(&nonce).unwrap();
@@ -383,7 +383,7 @@ impl ShuffleManager {
                             self.meta_bin_file.seek(SeekFrom::End(0)).unwrap();
                     }
                     self.meta_bin_file
-                        .write_all(&(meta_size).to_le_bytes())
+                        .write_all(&(meta_size).to_ne_bytes())
                         .unwrap();
                     self.meta_bin_file.write_all(&meta).unwrap();
                     self.meta_bin_file.write_all(&nonce).unwrap();
@@ -403,13 +403,13 @@ impl ShuffleManager {
                 self.dst_bin_file_idx[cur_bin_num] =
                     self.dst_bin_file.seek(SeekFrom::Current(0)).unwrap();
                 self.dst_bin_file
-                    .write_all(&(data_size).to_le_bytes())
+                    .write_all(&(data_size).to_ne_bytes())
                     .unwrap();
                 self.dst_bin_file
-                    .write_all(&(meta_size).to_le_bytes())
+                    .write_all(&(meta_size).to_ne_bytes())
                     .unwrap();
                 self.dst_bin_file
-                    .write_all(&(random_key_size).to_le_bytes())
+                    .write_all(&(random_key_size).to_ne_bytes())
                     .unwrap();
                 self.dst_bin_file.write_all(&data).unwrap();
                 self.dst_bin_file.write_all(&meta).unwrap();

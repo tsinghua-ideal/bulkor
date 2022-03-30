@@ -142,7 +142,7 @@ fn init_enclave_and_oram(n: u64) -> (SgxEnclave, u64, Vec<Vec<u8>>) {
 async fn handle_client(req_tx: Sender<Message>, mut stream: TcpStream) {
     let mut id_buf: [u8; 8] = Default::default();
     stream.read_exact(&mut id_buf).await.unwrap();
-    let id = u64::from_le_bytes(id_buf);
+    let id = u64::from_ne_bytes(id_buf);
     let (resp_tx, resp_rx) = flume::unbounded();
     req_tx
         .send_async(Message::CID((id, resp_tx)))

@@ -223,22 +223,22 @@ where
 
             //check the integrity
             let loaded_snapshot_id =
-                u64::from_le_bytes((&stash_data_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
+                u64::from_ne_bytes((&stash_data_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
             assert_eq!(loaded_snapshot_id, snapshot_id);
             let loaded_level =
-                u32::from_le_bytes((&stash_data_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
+                u32::from_ne_bytes((&stash_data_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
             assert_eq!(loaded_level, level);
             let loaded_lifetime_id =
-                u64::from_le_bytes((&stash_data_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
+                u64::from_ne_bytes((&stash_data_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
             assert_eq!(loaded_lifetime_id, lifetime_id);
             let loaded_snapshot_id =
-                u64::from_le_bytes((&stash_meta_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
+                u64::from_ne_bytes((&stash_meta_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
             assert_eq!(loaded_snapshot_id, snapshot_id);
             let loaded_level =
-                u32::from_le_bytes((&stash_meta_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
+                u32::from_ne_bytes((&stash_meta_buf[(ns + 24)..(ns + 28)]).try_into().unwrap());
             assert_eq!(loaded_level, level);
             let loaded_lifetime_id =
-                u64::from_le_bytes((&stash_meta_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
+                u64::from_ne_bytes((&stash_meta_buf[(ns + 28)..(ns + 36)]).try_into().unwrap());
             assert_eq!(loaded_lifetime_id, lifetime_id);
 
             let iter_data = (&stash_data_buf[(ns + 36)..]).chunks_exact(ValueSize::USIZE);
@@ -299,10 +299,8 @@ where
         // Choose what will be the next (secret) position of this item
         let new_pos = 1u64.random_child_at_height(self.height, &mut self.rng);
         // Set the new value and recover the old (current) position.
-        let (mut current_pos, is_invalid_pos) = self.pos.write(&key, &new_pos);
+        let (current_pos, is_invalid_pos) = self.pos.write(&key, &new_pos);
         debug_assert!(current_pos != 0, "position map told us the item is at 0");
-        let (shuffle_pos, is_valid_shuffle_pos) = self.storage.get_shuffle_pos(&key);
-        current_pos.cmov(is_invalid_pos & is_valid_shuffle_pos, &shuffle_pos);
         // Get the branch where we expect to find the item.
         // NOTE: If we move to a scheme where the tree can be resized dynamically,
         // then we should checkout at `current_pos.random_child_at_height(self.height)`.
@@ -381,17 +379,17 @@ where
         //TODO: This step can be in parallel with the following ones
         assert!(self.stash_data.len() == self.stash_meta.len());
         let mut stash_data = vec![0; NonceSize::USIZE + 16];
-        stash_data.extend_from_slice(&new_snapshot_id.to_le_bytes());
-        stash_data.extend_from_slice(&self.level.to_le_bytes());
-        stash_data.extend_from_slice(&lifetime_id.to_le_bytes());
+        stash_data.extend_from_slice(&new_snapshot_id.to_ne_bytes());
+        stash_data.extend_from_slice(&self.level.to_ne_bytes());
+        stash_data.extend_from_slice(&lifetime_id.to_ne_bytes());
         for d in &self.stash_data {
             stash_data.extend_from_slice(d);
         }
 
         let mut stash_meta = vec![0; NonceSize::USIZE + 16];
-        stash_meta.extend_from_slice(&new_snapshot_id.to_le_bytes());
-        stash_meta.extend_from_slice(&self.level.to_le_bytes());
-        stash_meta.extend_from_slice(&lifetime_id.to_le_bytes());
+        stash_meta.extend_from_slice(&new_snapshot_id.to_ne_bytes());
+        stash_meta.extend_from_slice(&self.level.to_ne_bytes());
+        stash_meta.extend_from_slice(&lifetime_id.to_ne_bytes());
         for m in &self.stash_meta {
             stash_meta.extend_from_slice(m);
         }

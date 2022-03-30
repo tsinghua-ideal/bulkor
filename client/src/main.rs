@@ -53,7 +53,7 @@ async fn main() -> io::Result<()> {
         .map(|(idx, data)| (idx, a64_bytes::<StorageBlockSize>(data)))
         .collect::<Vec<_>>();
 
-        wr.write_all(&client_id.to_le_bytes()).await?;
+        wr.write_all(&client_id.to_ne_bytes()).await?;
 
         for each in expected_queries {
             let query = build_query(client_id, query_id, each.0, each.1, &mut rng);
@@ -110,8 +110,8 @@ fn build_query(
     };
     let mut bytes = vec![0; QUERY_SIZE];
     let pos = NonceSize::USIZE + 16;
-    (&mut bytes[pos..(pos + 8)]).copy_from_slice(&client_id.to_le_bytes());
-    (&mut bytes[(pos + 8)..(pos + 16)]).copy_from_slice(&query_id.to_le_bytes());
+    (&mut bytes[pos..(pos + 8)]).copy_from_slice(&client_id.to_ne_bytes());
+    (&mut bytes[(pos + 8)..(pos + 16)]).copy_from_slice(&query_id.to_ne_bytes());
     query.to_slice(&mut bytes);
     let skip_enc = 16;
     s_encrypt(&QUERY_KEY, &mut bytes, skip_enc, rng);

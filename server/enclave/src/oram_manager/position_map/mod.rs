@@ -23,7 +23,8 @@ use rand_core::{CryptoRng, RngCore};
 use subtle::Choice;
 
 use crate::oram_storage::{
-    persist_trivial_posmap, recover_trivial_posmap, s_decrypt, s_encrypt, ORAM_KEY,
+    persist_trivial_posmap, recover_trivial_posmap, s_decrypt, s_encrypt,
+    shuffle_manager::oblivious_pull_trivial_posmap, ORAM_KEY,
 };
 use crate::oram_traits::{log2_ceil, ORAMCreator, PositionMap, PositionMapCreator, ORAM};
 use crate::{NonceSize, ID_TO_LOG_POS, IS_LATEST, LIFETIME_ID, SNAPSHOT_ID};
@@ -62,26 +63,28 @@ impl<R: RngCore + CryptoRng> TrivialPositionMap<R> {
             }
             s_decrypt(&ORAM_KEY, &mut posmap_buf, 24);
             let loaded_log_pos =
-                u64::from_le_bytes((&posmap_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
+                u64::from_ne_bytes((&posmap_buf[(ns + 16)..(ns + 24)]).try_into().unwrap());
             ID_TO_LOG_POS
                 .lock()
                 .unwrap()
                 .insert(snapshot_id, loaded_log_pos);
             //check the integrity
             let loaded_snapshot_id =
-                u64::from_le_bytes((&posmap_buf[(ns + 24)..(ns + 32)]).try_into().unwrap());
+                u64::from_ne_bytes((&posmap_buf[(ns + 24)..(ns + 32)]).try_into().unwrap());
             assert_eq!(loaded_snapshot_id, snapshot_id);
             if is_latest {
                 let loaded_lifetime_id =
-                    u64::from_le_bytes((&posmap_buf[(ns + 32)..(ns + 40)]).try_into().unwrap());
+                    u64::from_ne_bytes((&posmap_buf[(ns + 32)..(ns + 40)]).try_into().unwrap());
                 assert_eq!(loaded_lifetime_id, lifetime_id);
 
                 let iter_data = (&posmap_buf[(ns + 40)..]).chunks_exact(4);
                 assert_eq!(iter_data.remainder(), []);
                 data = iter_data
                     .into_iter()
-                    .map(|d| u32::from_le_bytes(d.try_into().unwrap()))
+                    .map(|d| u32::from_ne_bytes(d.try_into().unwrap()))
                     .collect::<Vec<_>>();
+            } else {
+                oblivious_pull_trivial_posmap(&mut data);
             }
         }
 
@@ -125,11 +128,11 @@ impl<R: RngCore + CryptoRng> PositionMap for TrivialPositionMap<R> {
             .unwrap()
             .remove(&new_snapshot_id)
             .unwrap();
-        posmap.extend_from_slice(&cur_log_pos.to_le_bytes());
-        posmap.extend_from_slice(&new_snapshot_id.to_le_bytes());
-        posmap.extend_from_slice(&lifetime_id.to_le_bytes());
+        posmap.extend_from_slice(&cur_log_pos.to_ne_bytes());
+        posmap.extend_from_slice(&new_snapshot_id.to_ne_bytes());
+        posmap.extend_from_slice(&lifetime_id.to_ne_bytes());
         for d in &self.data {
-            posmap.extend_from_slice(&d.to_le_bytes());
+            posmap.extend_from_slice(&d.to_ne_bytes());
         }
 
         s_encrypt(&ORAM_KEY, &mut posmap, 24, &mut self.rng);

@@ -37,7 +37,7 @@ where
         assert_eq!(bytes.len(), QUERY_SIZE);
         let ms = NonceSize::USIZE + 16 + 8 + 8; //meta size
         let op_type = 1u8.ct_eq(&bytes[ms]); //if write, op_type = Choice(1u8)
-        let idx = u64::from_le_bytes(bytes[(ms + 1)..(ms + 9)].try_into().unwrap());
+        let idx = u64::from_ne_bytes(bytes[(ms + 1)..(ms + 9)].try_into().unwrap());
         let mut new_val: A64Bytes<ValueSize> = Default::default();
         new_val.copy_from_slice(&bytes[(ms + 9)..(ms + 9 + ValueSize::USIZE)]);
         Query {

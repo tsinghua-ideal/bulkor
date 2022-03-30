@@ -35,8 +35,8 @@ mod path_oram;
 pub use path_oram::PathORAM;
 
 /// Meta size (see crate::oram_manager::path_oram for detailed explanation)
-type DataMetaSize = U24;
-type PosMetaSize = U16;
+pub type DataMetaSize = U24;
+pub type PosMetaSize = U16;
 
 /// Creator for PathORAM based on 4096-sized blocks of storage and bucket size
 /// (Z) of 2, and a basic recursive position map implementation

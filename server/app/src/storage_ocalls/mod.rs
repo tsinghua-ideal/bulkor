@@ -95,6 +95,9 @@ lazy_static! {
 
     /// Shuffle manager handler
     pub static ref SHUFFLE_MANAGER_ID: AtomicU64 = AtomicU64::new(0u64);
+
+    /// tmp position map (data, nonce, hash)
+    pub static ref TMP_POS_MAP: Mutex<(Vec<u8>, Vec<u8>, Vec<u8>)> = Mutex::new((Vec::new(), Vec::new(), Vec::new()));
 }
 
 //return (does snapshot become old, the newest value is on the left/right)
@@ -192,8 +195,6 @@ struct UntrustedAllocation {
     data_file: File,
     /// The file descriptor for meta file
     meta_file: File,
-    /// the nonce used for shuffle
-    shuffle_nonce: Vec<u8>,
     /// A flag set to true when a thread is in the critical section and released
     /// when it leaves. This is used to trigger assertions if there is a
     /// race happening on this API This is simpler and less expensive than
@@ -276,14 +277,6 @@ impl UntrustedAllocation {
             .read(true)
             .open(&meta_file_name)
             .unwrap();
-        let mut shuffle_nonce_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open("shuffle_nonce")
-            .unwrap();
-        let mut shuffle_nonce = Vec::new();
-        shuffle_nonce_file.read_to_end(&mut shuffle_nonce).unwrap();
 
         let data_pointer = unsafe {
             alloc(Layout::from_size_align(2 * count_in_mem * data_item_size, 8).unwrap())
@@ -294,7 +287,7 @@ impl UntrustedAllocation {
                 2 * count_in_mem * data_item_size
             )
         }
-        let meta_pointer = if snapshot_id > 0 && !is_latest && level == 0 {
+        let meta_pointer = if snapshot_id > 0 && !is_latest {
             //zero is filled during build oram from shuffle manager
             unsafe { alloc(Layout::from_size_align(2 * count_in_mem * meta_item_size, 8).unwrap()) }
         } else {
@@ -372,7 +365,6 @@ impl UntrustedAllocation {
             meta_pointer,
             data_file,
             meta_file,
-            shuffle_nonce,
             critical_section_flag,
             checkout_flag,
         }
@@ -498,28 +490,15 @@ pub extern "C" fn allocate_oram_storage(
     data_size: u64,
     meta_size: u64,
     id_out: *mut u64,
-    shuffle_nonce: *mut u8,
-    shuffle_nonce_size: u64,
 ) {
     let mut m = LEVEL_TO_ORAM_INST.lock().unwrap();
     let id = m.entry(level).or_insert(0);
+    //currentl we only handle the shuffle in the machine crash case
+    if *id > 0 {
+        assert!(is_latest != 0);
+    }
     println!("id = {:?}", id);
-    let shuffle_nonce =
-        unsafe { core::slice::from_raw_parts_mut(shuffle_nonce, shuffle_nonce_size as usize) };
-    if *id == 0 || (*id > 0 && is_latest == 0 && level > 0) {
-        //The read of stale data ORAM should not take this branch
-        if *id > 0 && is_latest == 0 {
-            let get_dropped =
-                unsafe { Box::<UntrustedAllocation>::from_raw(core::mem::transmute(*id)) };
-            assert!(
-                !get_dropped
-                    .critical_section_flag
-                    .swap(true, Ordering::SeqCst),
-                "Could not enter critical section when releasing storage"
-            );
-            #[cfg(debug_assertions)]
-            debug_checks::remove_id(*id);
-        }
+    if *id == 0 {
         println!(
             "before allocing, level = {:?}, snapshot_id = {:?}",
             level, snapshot_id
@@ -538,18 +517,6 @@ pub extern "C" fn allocate_oram_storage(
     }
     unsafe {
         *id_out = *id;
-    }
-    get_shuffle_nonce(*id, shuffle_nonce);
-}
-
-fn get_shuffle_nonce(id: u64, shuffle_nonce: &mut [u8]) {
-    let storage = unsafe {
-        core::mem::transmute::<_, *mut UntrustedAllocation>(id)
-            .as_mut()
-            .unwrap()
-    };
-    if shuffle_nonce.len() == storage.shuffle_nonce.len() {
-        shuffle_nonce.copy_from_slice(&storage.shuffle_nonce);
     }
 }
 
@@ -573,7 +540,10 @@ pub extern "C" fn allocate_shuffle_manager(
     let data_item_size = storage.data_item_size;
     let meta_item_size = storage.meta_item_size;
 
-    let num_bins = 2 * z as usize * storage.count / bin_size_in_block;
+    let mut num_bins = 2 * z as usize * storage.count / bin_size_in_block;
+    if num_bins == 0 {
+        num_bins = 1;
+    }
 
     LEVEL_TO_ORAM_INST
         .lock()
@@ -601,16 +571,17 @@ pub extern "C" fn allocate_shuffle_manager(
 }
 
 #[no_mangle]
-pub extern "C" fn build_oram_from_shuffle_manager(
-    shuffle_id: u64,
-    allocation_id: u64,
-    shuffle_nonce: *const u8,
-    shuffle_nonce_size: usize,
-) {
+pub extern "C" fn build_oram_from_shuffle_manager(shuffle_id: u64, allocation_id: u64) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     SHUFFLE_MANAGER_ID.store(0, Ordering::SeqCst);
     let manager =
         unsafe { Box::from_raw(core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id)) };
+    assert_eq!(manager.storage_id, allocation_id);
+    let storage = unsafe {
+        core::mem::transmute::<_, *mut UntrustedAllocation>(allocation_id)
+            .as_mut()
+            .unwrap()
+    };
     //release the space,
     drop(manager);
     //delete shuffle files
@@ -630,28 +601,11 @@ pub extern "C" fn build_oram_from_shuffle_manager(
     }
     let _release_mem = unsafe { libc::malloc_trim(0) };
 
-    //TODO: may need lock for manager, but no need for storage, because the storage id is removed
-    let storage = unsafe {
-        core::mem::transmute::<_, *mut UntrustedAllocation>(allocation_id)
-            .as_mut()
-            .unwrap()
-    };
-    let shuffle_nonce = unsafe { core::slice::from_raw_parts(shuffle_nonce, shuffle_nonce_size) };
-    storage.shuffle_nonce = shuffle_nonce.to_vec();
-    //persist shuffle_nonce
-    let shuffle_nonce_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open("shuffle_nonce")
-        .unwrap();
-    shuffle_nonce_file.write_all_at(&shuffle_nonce, 0).unwrap();
-
     //no need to deal with ptr_file
     assert!(LEVEL_TO_ORAM_INST
         .lock()
         .unwrap()
-        .insert(0, allocation_id)
+        .insert(storage.level, allocation_id)
         .is_none());
     #[cfg(debug_assertions)]
     debug_checks::add_id(allocation_id);
@@ -1065,7 +1019,7 @@ pub extern "C" fn get_valid_snapshot_id(
                 println!("id_mem = {:?}", id_mem);
                 unsafe {
                     *snapshot_id = id_mem;
-                    *lifetime_id_from_meta = u64::from_le_bytes(lifetime_id_buf);
+                    *lifetime_id_from_meta = u64::from_ne_bytes(lifetime_id_buf);
                 }
             } else {
                 snapshot_to_tposmap.remove(&id_mem);
@@ -1087,7 +1041,7 @@ pub extern "C" fn get_valid_snapshot_id(
                 println!("id_disk = {:?}", id_disk);
                 unsafe {
                     *snapshot_id = id_disk;
-                    *lifetime_id_from_meta = u64::from_le_bytes(lifetime_id_buf);
+                    *lifetime_id_from_meta = u64::from_ne_bytes(lifetime_id_buf);
                 }
                 //remove other files
                 id_to_files.remove(&id_disk);
@@ -1585,6 +1539,44 @@ pub extern "C" fn shuffle_push_bin(shuffle_id: u64, cur_bin_num: usize, bin_type
     };
     //TODO: may need lock
     manager.push_bin(cur_bin_num, bin_type);
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_push_tmp_posmap(
+    data_size: usize,
+    nonce_size: usize,
+    hash_size: usize,
+    data_ptr: *mut usize,
+    nonce_ptr: *mut usize,
+    hash_ptr: *mut usize,
+) {
+    let mut t = TMP_POS_MAP.lock().unwrap();
+    t.0.resize(data_size, 0);
+    t.1.resize(nonce_size, 0);
+    t.2.resize(hash_size, 0);
+    unsafe {
+        *data_ptr = (&mut t.0) as *mut Vec<u8> as usize;
+        *nonce_ptr = (&mut t.1) as *mut Vec<u8> as usize;
+        *hash_ptr = (&mut t.2) as *mut Vec<u8> as usize;
+    }
+}
+#[no_mangle]
+pub extern "C" fn shuffle_pull_tmp_posmap(
+    data_ptr: *mut usize,
+    nonce_ptr: *mut usize,
+    hash_ptr: *mut usize,
+) {
+    let t = TMP_POS_MAP.lock().unwrap();
+    unsafe {
+        *data_ptr = (&t.0) as *const Vec<u8> as usize;
+        *nonce_ptr = (&t.1) as *const Vec<u8> as usize;
+        *hash_ptr = (&t.2) as *const Vec<u8> as usize;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn shuffle_release_tmp_posmap() {
+    *TMP_POS_MAP.lock().unwrap() = (Vec::new(), Vec::new(), Vec::new());
 }
 
 #[no_mangle]

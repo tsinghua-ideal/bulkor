@@ -154,8 +154,8 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
         let mut query_cnt_buf = [0; 8];
         l.read_exact(&mut lifetime_id_buf).unwrap();
         l.read_exact(&mut query_cnt_buf).unwrap();
-        lifetime_id_from_log = u64::from_le_bytes(lifetime_id_buf);
-        query_cnt = u64::from_le_bytes(query_cnt_buf);
+        lifetime_id_from_log = u64::from_ne_bytes(lifetime_id_buf);
+        query_cnt = u64::from_ne_bytes(query_cnt_buf);
     });
 
     // There is a case that query_cnt is stale, then the subsequent new snapshot after
@@ -220,7 +220,7 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
             l.seek(SeekFrom::Start(log_pos - 8)).unwrap();
             let mut snapshot_id_buf = [0; 8];
             l.read_exact(&mut snapshot_id_buf).unwrap();
-            assert_eq!(snapshot_id, u64::from_le_bytes(snapshot_id_buf));
+            assert_eq!(snapshot_id, u64::from_ne_bytes(snapshot_id_buf));
         } else {
             l.seek(SeekFrom::Start(0)).unwrap();
             assert_eq!(log_pos, 0);
@@ -239,7 +239,7 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
             //read batch size
             let mut batch_size_buf = [0; 8];
             l.read_exact(&mut batch_size_buf).unwrap();
-            let batch_size = u64::from_le_bytes(batch_size_buf) as usize;
+            let batch_size = u64::from_ne_bytes(batch_size_buf) as usize;
             log_pos += 8;
 
             let mut queries_buf = vec![0; batch_size * QUERY_SIZE];
@@ -249,7 +249,7 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
             //read lifetime id
             let mut lifetime_id_buf = [0; 8];
             l.read_exact(&mut lifetime_id_buf).unwrap();
-            if u64::from_le_bytes(lifetime_id_buf) < lifetime_id {
+            if u64::from_ne_bytes(lifetime_id_buf) < lifetime_id {
                 //TODO: ignore the recorded pos
             }
             log_pos += 8;
@@ -262,7 +262,7 @@ pub extern "C" fn ecall_create_oram(n: u64, results_ptr: *mut usize) -> u64 {
             // however, we should seek forward
             // let mut query_cnt_buf = [0; 8];
             // l.read_exact(&mut query_cnt_buf).unwrap();
-            // QUERY_CNT.store(u64::from_le_bytes(query_cnt_buf), Ordering::SeqCst);
+            // QUERY_CNT.store(u64::from_ne_bytes(query_cnt_buf), Ordering::SeqCst);
             let actual_log_pos = l.seek(SeekFrom::Current(8)).unwrap();
             log_pos += 8;
             assert_eq!(log_pos, actual_log_pos);
@@ -332,10 +332,10 @@ pub extern "C" fn ecall_access(
             .append(true)
             .open_ex("log", &ORAM_KEY.clone().into())
             .unwrap();
-        log.write_all(&batch_size.to_le_bytes()).unwrap();
+        log.write_all(&batch_size.to_ne_bytes()).unwrap();
         log.write_all(bytes).unwrap(); //bytes have been decrypted
-        log.write_all(&lifetime_id.to_le_bytes()).unwrap();
-        log.write_all(&cur_query_cnt.to_le_bytes()).unwrap();
+        log.write_all(&lifetime_id.to_ne_bytes()).unwrap();
+        log.write_all(&cur_query_cnt.to_ne_bytes()).unwrap();
         //TODO: some other information may be logged per batch
         log.stream_position().unwrap()
     };
