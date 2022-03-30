@@ -35,6 +35,7 @@
 
 #![deny(missing_docs)]
 
+use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use regex::Regex;
 use std::{
     alloc::{alloc, alloc_zeroed, dealloc, Layout},
@@ -44,7 +45,7 @@ use std::{
     convert::TryInto,
     fs::{self, remove_file, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::FileExt,
+    os::unix::{fs::FileExt, prelude::AsRawFd},
     path::{Path, PathBuf},
     slice,
     string::ToString,
@@ -68,7 +69,7 @@ lazy_static! {
     ///
     /// Changing this number influences any ORAM storage objects created after the change,
     /// but not before. So, it should normally be changed during enclave init, if at all.
-    pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(33u32); // 8 GB
+    pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(25u32-1u32.log2());
 
     /// It is used to recover the already allocated ORAM tree
     /// by mapping the level id to oram pointer
@@ -331,9 +332,30 @@ impl UntrustedAllocation {
             if ptr_file_len < ptrs_len {
                 ptr_file.write_all(&ptrs[ptr_file_len..ptrs_len]).unwrap();
             }
-            data_file.flush().unwrap();
-            meta_file.flush().unwrap();
-            ptr_file.flush().unwrap();
+            data_file.sync_all().unwrap();
+            meta_file.sync_all().unwrap();
+            ptr_file.sync_all().unwrap();
+            posix_fadvise(
+                data_file.as_raw_fd(),
+                0,
+                0,
+                PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+            )
+            .unwrap();
+            posix_fadvise(
+                meta_file.as_raw_fd(),
+                0,
+                0,
+                PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+            )
+            .unwrap();
+            posix_fadvise(
+                ptr_file.as_raw_fd(),
+                0,
+                0,
+                PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+            )
+            .unwrap();
         } else {
             //recovery
             //For level==0 && !is_latest case, no data and meta is loaded
@@ -726,6 +748,31 @@ pub unsafe extern "C" fn persist_oram_storage(
             .unwrap();
 
         new_ptr_file.write_all(&ptrs_d).unwrap();
+
+        (*ptr).data_file.sync_all().unwrap();
+        (*ptr).meta_file.sync_all().unwrap();
+        new_ptr_file.sync_all().unwrap();
+        posix_fadvise(
+            (*ptr).data_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            (*ptr).meta_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
+        posix_fadvise(
+            new_ptr_file.as_raw_fd(),
+            0,
+            0,
+            PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        )
+        .unwrap();
     } else {
         //in mem snapshot switch
         clear_all_in_mem_sts(ptrs_m_mut, count_in_mem - 1);
@@ -838,6 +885,21 @@ pub unsafe extern "C" fn checkout_oram_storage(
         (*ptr).critical_section_flag.swap(false, Ordering::SeqCst),
         "Could not leave critical section when checking out storage"
     );
+
+    posix_fadvise(
+        (*ptr).data_file.as_raw_fd(),
+        0,
+        0,
+        PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    )
+    .unwrap();
+    posix_fadvise(
+        (*ptr).meta_file.as_raw_fd(),
+        0,
+        0,
+        PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    )
+    .unwrap();
 }
 
 /// # Safety
@@ -951,6 +1013,22 @@ pub unsafe extern "C" fn checkin_oram_storage(
         (*ptr).critical_section_flag.swap(false, Ordering::SeqCst),
         "Could not leave critical section when checking in storage"
     );
+    (*ptr).data_file.sync_all().unwrap();
+    (*ptr).meta_file.sync_all().unwrap();
+    posix_fadvise(
+        (*ptr).data_file.as_raw_fd(),
+        0,
+        0,
+        PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    )
+    .unwrap();
+    posix_fadvise(
+        (*ptr).meta_file.as_raw_fd(),
+        0,
+        0,
+        PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    )
+    .unwrap();
 }
 
 #[no_mangle]

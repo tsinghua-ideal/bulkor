@@ -16,6 +16,7 @@
 // under the License..
 #![feature(drain_filter)]
 #![feature(map_first_last)]
+#![feature(int_log)]
 
 extern crate sgx_types;
 extern crate sgx_urts;
@@ -24,6 +25,8 @@ use sgx_types::*;
 use sgx_urts::SgxEnclave;
 #[macro_use]
 extern crate lazy_static;
+#[macro_use]
+extern crate libc;
 use aes::{cipher::NewCipher, Aes128Ctr};
 use aligned_cmov::{
     typenum::{Unsigned, U1024, U64},
@@ -303,8 +306,7 @@ fn main() {
     let base_dir = std::env::current_dir().expect("not found path");
     logger::initialize_loggers(base_dir.join("running.log"), LogLevel::Info);
 
-    //let n = 8 << 20; //8M*1KB
-    let n = 8 << 10;
+    let n = 16 << 10; //16K*1KB
     let now = Instant::now();
     let (enclave, eid, remaining_results) = init_enclave_and_oram(n);
 
