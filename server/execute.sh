@@ -7,7 +7,6 @@ sed -i "s/[0-9]\{1,2\}u32-/${lognum}u32-/g" app/src/storage_ocalls/mod.rs
 for ratio in 16 8 4 2 1
 do
     sed -i "s/${lognum}u32-[0-9]\{1,2\}u/${lognum}u32-${ratio}u/g" app/src/storage_ocalls/mod.rs
-    sed -i "s/num_bins \/ [0-9]\{1,2\}/num_bins \/ ${ratio}/g" app/src/storage_ocalls/shuffle_manager.rs
     make
     cd bin
     nocache ./app > insert_log_${k}_${ratio}.txt
