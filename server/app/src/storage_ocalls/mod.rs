@@ -566,6 +566,8 @@ pub extern "C" fn allocate_shuffle_manager(
     if num_bins == 0 {
         num_bins = 1;
     }
+    let ratio = storage.count / storage.count_in_mem;
+    assert!(ratio >= 1);
 
     LEVEL_TO_ORAM_INST
         .lock()
@@ -584,6 +586,7 @@ pub extern "C" fn allocate_shuffle_manager(
         data_item_size,
         meta_item_size,
         num_bins,
+        ratio,
     ));
     let id = Box::into_raw(shuffle_manager) as u64;
     SHUFFLE_MANAGER_ID.store(id, Ordering::SeqCst);

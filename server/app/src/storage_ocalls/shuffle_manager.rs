@@ -33,8 +33,14 @@ pub struct ShuffleManager {
 }
 
 impl ShuffleManager {
-    pub fn new(storage_id: u64, data_size: usize, meta_size: usize, num_bins: usize) -> Self {
-        let num_bins_on_disk = num_bins - num_bins / 1;
+    pub fn new(
+        storage_id: u64,
+        data_size: usize,
+        meta_size: usize,
+        num_bins: usize,
+        in_memory_ratio: usize,
+    ) -> Self {
+        let num_bins_on_disk = num_bins - num_bins / in_memory_ratio;
 
         let data_bin_file_name = PathBuf::from("shuffle_data_bin");
         let meta_bin_file_name = PathBuf::from("shuffle_meta_bin");
