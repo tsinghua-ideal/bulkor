@@ -40,7 +40,7 @@ impl ShuffleManager {
         num_bins: usize,
         in_memory_ratio: usize,
     ) -> Self {
-        let num_bins_on_disk = num_bins - num_bins / in_memory_ratio;
+        let num_bins_on_disk = num_bins - ((num_bins - 1) / in_memory_ratio + 1);
 
         let data_bin_file_name = PathBuf::from("shuffle_data_bin");
         let meta_bin_file_name = PathBuf::from("shuffle_meta_bin");
