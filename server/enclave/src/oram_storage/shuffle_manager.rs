@@ -1861,7 +1861,10 @@ fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
     //should be consistent with crate::oram_manager::position_map
     //note that leaf is stored as u32, not u64, for some reason I don't know yet
     let l = log2_ceil(DataSize::U64) - 2;
-    let next_size = cur_size >> l;
+    let mut next_size = cur_size >> l;
+    if next_size == 0 {
+        next_size = 1;
+    }
 
     //no dummy elements in bin (but dummy ORAM blocks exist)
     let bin_size = BIN_SIZE_IN_BLOCK >> 1;
