@@ -719,6 +719,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
             num_bins,
             1,
             u64::MAX,
+            false,
             rng,
         );
         let dur = now.elapsed().as_nanos() as f64 * 1e-9;
@@ -2311,6 +2312,7 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
     num_bins: usize,
     key_by: usize,
     invalid_addr: u64,
+    is_rehearsal: bool,
     rng: &mut Rng,
 ) where
     DataSize: ArrayLength<u8> + PartialDiv<U8>,
@@ -2321,20 +2323,22 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
         item_left: &mut A8Bytes<MetaSize>,
         item_right: &mut A8Bytes<MetaSize>,
         sep: u64,
+        offset: u64,
         key_by: usize,
         invalid_addr: u64,
     ) {
         let new_idx_left = get_key(item_left, key_by);
         let new_idx_right = get_key(item_right, key_by);
         let cond = Choice::from(
-            (new_idx_left != invalid_addr && new_idx_left >= sep
-                || new_idx_right != invalid_addr && new_idx_right < sep) as u8,
+            (new_idx_left != invalid_addr && new_idx_left - offset >= sep
+                || new_idx_right != invalid_addr && new_idx_right - offset < sep) as u8,
         );
         cswap(cond, item_left, item_right);
     }
 
     fn place_inside_bin<MetaSize: ArrayLength<u8> + PartialDiv<U8>>(
         bin: &mut [A8Bytes<MetaSize>],
+        offset: u64,
         key_by: usize,
         invalid_addr: u64,
     ) {
@@ -2351,7 +2355,14 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
                 if i < j {
                     let sep = (base + k) as u64;
                     let t = bin.split_at_mut(i + 1);
-                    core_f(&mut t.0[i], &mut t.1[j - i - 1], sep, key_by, invalid_addr);
+                    core_f(
+                        &mut t.0[i],
+                        &mut t.1[j - i - 1],
+                        sep,
+                        offset,
+                        key_by,
+                        invalid_addr,
+                    );
                 }
             }
             k >>= 1;
@@ -2374,7 +2385,14 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
             &mut meta,
             &mut Vec::new(),
         );
-        place_inside_bin(&mut meta, key_by, invalid_addr);
+        place_inside_bin(&mut meta, 0, key_by, invalid_addr);
+        if is_rehearsal {
+            for (i, meta_item) in meta.iter_mut().enumerate() {
+                let new_idx = get_key(meta_item, key_by);
+                assert!(new_idx == i as u64 || new_idx == invalid_addr);
+                meta_item.as_mut_ne_u64_slice()[key_by] = i as u64;
+            }
+        }
         push_bin::<_, DataSize, MetaSize>(
             aes_key,
             hash_key,
@@ -2391,71 +2409,90 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
             bin_switch(shuffle_id, 0, num_bins);
         }
     } else {
-        let log_b = (num_bins as f64).log2() as usize;
+        let mut expected_new_idx = 0;
         let n = num_bins * bin_size;
         let mut k = n >> 1;
-        let mut pow_i = 1 << (log_b - 1);
-        for i in (0..log_b).rev() {
+        while k >= bin_size {
+            let mut meta = vec![Default::default(); 2 * bin_size];
             let mut base = 0;
-            for j in 0..num_bins / 2 {
-                let j_prime = (j >> i) << i;
-                //the computation of j_elem is error-prone
-                let j_elem = (j_prime + j) * bin_size;
-                if j_elem & ((k << 1) - 1) == 0 && j_elem != 0 {
+            for i in 0..n {
+                //if i % (k*2)
+                if i & ((k << 1) - 1) == 0 && i != 0 {
                     base += k << 1;
                 }
-                let sep = (base + k) as u64;
-                let mut meta = vec![Default::default(); 2 * bin_size];
-                for c in [0, 1] {
-                    pull_bin::<DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        j_prime + j + c * pow_i,
-                        1,
-                        &mut 0,
-                        &mut Vec::new(),
-                        &mut meta[c * bin_size..(c + 1) * bin_size],
-                        &mut Vec::new(),
-                    );
-                }
-                {
+                let j = i ^ k;
+                if i < j && (i + 1) % bin_size == 0 {
+                    let sep = (base + k) as u64;
+
+                    let cur_bin_num = [i / bin_size, j / bin_size];
+                    for c in [0, 1] {
+                        pull_bin::<DataSize, MetaSize>(
+                            aes_key,
+                            hash_key,
+                            freshness_nonce,
+                            shuffle_id,
+                            cur_bin_num[c],
+                            1,
+                            &mut 0,
+                            &mut Vec::new(),
+                            &mut meta[c * bin_size..(c + 1) * bin_size],
+                            &mut Vec::new(),
+                        );
+                    }
                     //oblivious placement across bins
                     let split_meta_mut = meta.split_at_mut(bin_size);
                     for (item_left, item_right) in
                         split_meta_mut.0.iter_mut().zip(split_meta_mut.1.iter_mut())
                     {
-                        core_f(item_left, item_right, sep, key_by, invalid_addr);
+                        core_f(item_left, item_right, sep, 0, key_by, invalid_addr);
                     }
 
-                    //oblivious placement inside bins
-                    if i == 0 {
-                        assert_eq!(pow_i, 1);
-                        place_inside_bin(split_meta_mut.0, key_by, invalid_addr);
-                        place_inside_bin(split_meta_mut.1, key_by, invalid_addr);
+                    {
+                        //oblivious placement inside bins
+                        if k == bin_size {
+                            place_inside_bin(
+                                split_meta_mut.0,
+                                (cur_bin_num[0] * bin_size) as u64,
+                                key_by,
+                                invalid_addr,
+                            );
+                            place_inside_bin(
+                                split_meta_mut.1,
+                                (cur_bin_num[1] * bin_size) as u64,
+                                key_by,
+                                invalid_addr,
+                            );
+                            if is_rehearsal {
+                                for meta_item in split_meta_mut
+                                    .0
+                                    .iter_mut()
+                                    .chain(split_meta_mut.1.iter_mut())
+                                {
+                                    meta_item.as_mut_ne_u64_slice()[key_by] = expected_new_idx;
+                                    expected_new_idx += 1;
+                                }
+                            }
+                        }
                     }
-                }
-
-                for c in [0, 1] {
-                    push_bin::<_, DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        j_prime + j + c * pow_i,
-                        1,
-                        &mut Vec::new(),
-                        &mut meta[c * bin_size..(c + 1) * bin_size],
-                        &mut Vec::new(),
-                        rng,
-                    );
+                    for c in [0, 1] {
+                        push_bin::<_, DataSize, MetaSize>(
+                            aes_key,
+                            hash_key,
+                            freshness_nonce,
+                            shuffle_id,
+                            cur_bin_num[c],
+                            1,
+                            &mut Vec::new(),
+                            &mut meta[c * bin_size..(c + 1) * bin_size],
+                            &mut Vec::new(),
+                            rng,
+                        );
+                    }
                 }
             }
             unsafe {
                 bin_switch(shuffle_id, 0, num_bins);
             }
-            pow_i >>= 1;
             k >>= 1;
         }
     }
@@ -2626,6 +2663,7 @@ fn shuffle_core<Rng, DataSize, MetaSize, Z>(
         num_bins,
         2,
         0,
+        true,
         rng,
     );
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
