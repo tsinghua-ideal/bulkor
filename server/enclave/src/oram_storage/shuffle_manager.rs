@@ -1,5 +1,7 @@
 use crate::oram_manager::{DataMetaSize, PosMetaSize};
-use crate::oram_storage::{compute_block_hash, make_aes_nonce, ExtraMeta, ExtraMetaSize, Hash};
+use crate::oram_storage::{
+    compute_block_hash, make_aes_nonce, ExtraMeta, ExtraMetaSize, Hash, IN_ENCLAVE_RATIO,
+};
 use crate::oram_traits::{log2_ceil, HeapORAMStorage};
 use crate::{AuthCipherType, AuthNonceSize, CipherType, KeySize, NonceSize, ALLOCATOR};
 use aes::cipher::{NewCipher, StreamCipher};
@@ -14,6 +16,7 @@ use rand_core::{CryptoRng, RngCore};
 use sgx_trts::trts::rsgx_read_rand;
 use std::convert::TryInto;
 use std::ops::{Add, Deref, Div, Mul};
+use std::sync::{Arc, SgxMutex as Mutex, SgxRwLock as RwLock};
 use std::time::Instant;
 use std::untrusted::time::InstantEx;
 use std::vec::Vec;
@@ -28,6 +31,11 @@ lazy_static! {
     // The key used to encrypt the tmp position map. Note that the tmp pos map is transfer across
     // levels of ORAM, so the key cannot use the aes_key or hash_key of each ORAM.
     pub static ref POSMAP_KEY: GenericArray<u8, KeySize> = GenericArray::<u8, KeySize>::default();
+    // cache bin inside enclave
+    pub static ref DATA_BIN_BUF: Arc<RwLock<Vec<Arc<Mutex<Vec<u8>>>>>> = Arc::new(RwLock::new(Vec::new()));
+    pub static ref META_BIN_BUF: Arc<RwLock<Vec<Arc<Mutex<Vec<u8>>>>>> = Arc::new(RwLock::new(Vec::new()));
+    pub static ref SRC_BINS: Arc<RwLock<Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>)>>>>> = Arc::new(RwLock::new(Vec::new()));
+    pub static ref DST_BINS: Arc<RwLock<Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>)>>>>> = Arc::new(RwLock::new(Vec::new()));
 }
 
 //return the hash of current node and the extrameta which keeps hashes of children
@@ -264,33 +272,82 @@ fn push_bin<Rng, DataSize, MetaSize>(
     data: &mut [A64Bytes<DataSize>],
     meta: &mut [A8Bytes<MetaSize>],
     random_keys: &mut [u64],
+    num_bins: usize,
     rng: &mut Rng,
 ) where
     Rng: RngCore + CryptoRng,
     DataSize: ArrayLength<u8> + PartialDiv<U8>,
     MetaSize: ArrayLength<u8> + PartialDiv<U8>,
 {
-    let (nonce, hash) = encrypt_and_authenticate_bin(
-        aes_key,
-        hash_key,
-        data,
-        meta,
-        random_keys,
-        cur_bin_num,
-        &freshness_nonce,
-        rng,
-    );
+    let num_bins_encl = (num_bins - 1) / *IN_ENCLAVE_RATIO + 1;
+    if cur_bin_num >= num_bins - num_bins_encl {
+        let data_slice = unsafe {
+            core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * DataSize::USIZE)
+        };
+        let meta_slice = unsafe {
+            core::slice::from_raw_parts(meta.as_ptr() as *const u8, meta.len() * MetaSize::USIZE)
+        };
+        let random_key_slice = unsafe {
+            core::slice::from_raw_parts(random_keys.as_ptr() as *const u8, random_keys.len() * 8)
+        };
+        if bin_type == 0 {
+            if !data.is_empty() {
+                let data_bin_buf = DATA_BIN_BUF.read().unwrap();
+                let mut data_bin = data_bin_buf[cur_bin_num - (num_bins - num_bins_encl)]
+                    .lock()
+                    .unwrap();
+                *data_bin = Vec::new();
+                data_bin.extend_from_slice(data_slice);
+            }
+            if !meta.is_empty() {
+                let meta_bin_buf = META_BIN_BUF.read().unwrap();
+                let mut meta_bin = meta_bin_buf[cur_bin_num - (num_bins - num_bins_encl)]
+                    .lock()
+                    .unwrap();
+                *meta_bin = Vec::new();
+                meta_bin.extend_from_slice(meta_slice);
+            }
+        } else {
+            let dst_bins = DST_BINS.read().unwrap();
+            let mut dst_bin = dst_bins[cur_bin_num - (num_bins - num_bins_encl)]
+                .lock()
+                .unwrap();
+            if !data.is_empty() {
+                dst_bin.0 = Vec::new();
+                dst_bin.0.extend_from_slice(data_slice);
+            }
+            if !meta.is_empty() {
+                dst_bin.1 = Vec::new();
+                dst_bin.1.extend_from_slice(meta_slice);
+            }
+            if !random_keys.is_empty() {
+                dst_bin.2 = Vec::new();
+                dst_bin.2.extend_from_slice(random_key_slice);
+            }
+        }
+    } else {
+        let (nonce, hash) = encrypt_and_authenticate_bin(
+            aes_key,
+            hash_key,
+            data,
+            meta,
+            random_keys,
+            cur_bin_num,
+            &freshness_nonce,
+            rng,
+        );
 
-    helpers::shuffle_push_bin_ocall(
-        shuffle_id,
-        cur_bin_num,
-        bin_type,
-        data,
-        meta,
-        random_keys,
-        &nonce,
-        &hash,
-    );
+        helpers::shuffle_push_bin_ocall(
+            shuffle_id,
+            cur_bin_num,
+            bin_type,
+            data,
+            meta,
+            random_keys,
+            &nonce,
+            &hash,
+        );
+    }
 }
 
 //after pull_bin, the bin space in the untrusted domain is released
@@ -301,6 +358,7 @@ fn pull_bin<DataSize, MetaSize>(
     freshness_nonce: &GenericArray<u8, NonceSize>,
     shuffle_id: u64,
     cur_bin_num: usize,
+    num_bins: usize,
     bin_type: u8,
     bin_size: &mut usize,
     data: &mut [A64Bytes<DataSize>],
@@ -310,33 +368,87 @@ fn pull_bin<DataSize, MetaSize>(
     DataSize: ArrayLength<u8> + PartialDiv<U8>,
     MetaSize: ArrayLength<u8> + PartialDiv<U8>,
 {
-    let mut nonce = GenericArray::<u8, NonceSize>::default();
-    let mut hash = Default::default();
-    helpers::shuffle_pull_bin_ocall(
-        shuffle_id,
-        cur_bin_num,
-        bin_type,
-        bin_size,
-        data,
-        meta,
-        random_keys,
-        &mut nonce,
-        &mut hash,
-    );
-    let has_data = (data.len() > 0) as usize;
-    let has_meta = (meta.len() > 0) as usize;
-    let has_random_keys = (random_keys.len() > 0) as usize;
-    decrypt_and_verify_bin(
-        aes_key,
-        hash_key,
-        &mut data[..*bin_size * has_data],
-        &mut meta[..*bin_size * has_meta],
-        &mut random_keys[..*bin_size * has_random_keys],
-        cur_bin_num,
-        &freshness_nonce,
-        &nonce,
-        &hash,
-    );
+    let num_bins_encl = (num_bins - 1) / *IN_ENCLAVE_RATIO + 1;
+    if cur_bin_num >= num_bins - num_bins_encl {
+        let data_slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                data.as_mut_ptr() as *mut u8,
+                data.len() * DataSize::USIZE,
+            )
+        };
+        let meta_slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                meta.as_mut_ptr() as *mut u8,
+                meta.len() * MetaSize::USIZE,
+            )
+        };
+        let random_key_slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                random_keys.as_mut_ptr() as *mut u8,
+                random_keys.len() * 8,
+            )
+        };
+        if bin_type == 0 {
+            if !data.is_empty() {
+                let data_bin_buf = DATA_BIN_BUF.read().unwrap();
+                let data_bin = data_bin_buf[cur_bin_num - (num_bins - num_bins_encl)]
+                    .lock()
+                    .unwrap();
+                data_slice[0..data_bin.len()].copy_from_slice(&*data_bin);
+                *bin_size = data_bin.len() / DataSize::USIZE;
+            }
+            if !meta.is_empty() {
+                let meta_bin_buf = META_BIN_BUF.read().unwrap();
+                let meta_bin = meta_bin_buf[cur_bin_num - (num_bins - num_bins_encl)]
+                    .lock()
+                    .unwrap();
+                meta_slice[0..meta_bin.len()].copy_from_slice(&*meta_bin);
+                *bin_size = meta_bin.len() / MetaSize::USIZE;
+            }
+        } else {
+            let src_bins = SRC_BINS.read().unwrap();
+            let src_bin = src_bins[cur_bin_num - (num_bins - num_bins_encl)]
+                .lock()
+                .unwrap();
+            if !data.is_empty() {
+                data_slice[0..src_bin.0.len()].copy_from_slice(&*src_bin.0);
+            }
+            assert!(!meta_slice.is_empty());
+            meta_slice[0..src_bin.1.len()].copy_from_slice(&*src_bin.1);
+            *bin_size = src_bin.1.len() / MetaSize::USIZE;
+            if !random_keys.is_empty() {
+                random_key_slice[0..src_bin.2.len()].copy_from_slice(&*src_bin.2);
+            }
+        }
+    } else {
+        let mut nonce = GenericArray::<u8, NonceSize>::default();
+        let mut hash = Default::default();
+        helpers::shuffle_pull_bin_ocall(
+            shuffle_id,
+            cur_bin_num,
+            bin_type,
+            bin_size,
+            data,
+            meta,
+            random_keys,
+            &mut nonce,
+            &mut hash,
+        );
+        let has_data = (data.len() > 0) as usize;
+        let has_meta = (meta.len() > 0) as usize;
+        let has_random_keys = (random_keys.len() > 0) as usize;
+        decrypt_and_verify_bin(
+            aes_key,
+            hash_key,
+            &mut data[..*bin_size * has_data],
+            &mut meta[..*bin_size * has_meta],
+            &mut random_keys[..*bin_size * has_random_keys],
+            cur_bin_num,
+            &freshness_nonce,
+            &nonce,
+            &hash,
+        );
+    }
 }
 
 fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
@@ -366,6 +478,22 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
     let mut cur_bin_num = num_bins - 1;
     let mut e_count = count as usize;
     let mut b_count = e_count >> 1;
+
+    let num_bins_encl = (num_bins - 1) / *IN_ENCLAVE_RATIO + 1;
+    DATA_BIN_BUF
+        .write()
+        .unwrap()
+        .resize_with(num_bins_encl, || Arc::new(Mutex::new(Vec::new())));
+    META_BIN_BUF
+        .write()
+        .unwrap()
+        .resize_with(num_bins_encl, || Arc::new(Mutex::new(Vec::new())));
+    SRC_BINS.write().unwrap().resize_with(num_bins_encl, || {
+        Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new())))
+    });
+    DST_BINS.write().unwrap().resize_with(num_bins_encl, || {
+        Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new())))
+    });
 
     let mut prev_tier_hash: Hash = Default::default();
 
@@ -461,6 +589,7 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                 &mut data,
                 &mut Vec::new(),
                 &mut Vec::new(),
+                num_bins,
                 rng,
             );
             push_bin::<_, DataSize, MetaSize>(
@@ -473,6 +602,7 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                 &mut Vec::new(),
                 &mut original_meta,
                 &mut Vec::new(),
+                num_bins,
                 rng,
             );
 
@@ -488,9 +618,9 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                 &mut Vec::new(),
                 &mut meta,
                 &mut Vec::new(),
+                num_bins,
                 rng,
             );
-
             b_count = 0;
         } else {
             let mut cur_tier_hasher = Blake2b::new();
@@ -571,6 +701,7 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                     &mut data,
                     &mut Vec::new(),
                     &mut Vec::new(),
+                    num_bins,
                     rng,
                 );
                 push_bin::<_, DataSize, MetaSize>(
@@ -583,6 +714,7 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                     &mut Vec::new(),
                     &mut original_meta,
                     &mut Vec::new(),
+                    num_bins,
                     rng,
                 );
 
@@ -600,6 +732,7 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                     &mut Vec::new(),
                     &mut meta,
                     &mut Vec::new(),
+                    num_bins,
                     rng,
                 );
 
@@ -616,9 +749,7 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
         }
     }
 
-    unsafe {
-        bin_switch(shuffle_id, 0, num_bins);
-    }
+    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
 
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("finish pull all oram buckets, {:?}s", dur);
@@ -771,6 +902,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
             seal_nonce: &GenericArray<u8, NonceSize>,
             shuffle_id: u64,
             cur_bin_num: usize,
+            num_bins: usize,
             bin_size_in_bucket: usize,
         ) -> (Vec<A64Bytes<DataSize>>, Vec<A8Bytes<DstMetaSize>>)
         where
@@ -790,6 +922,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 seal_nonce,
                 shuffle_id,
                 cur_bin_num,
+                num_bins,
                 1,
                 &mut actual_bin_size,
                 &mut data,
@@ -820,6 +953,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
             seal_nonce: &GenericArray<u8, NonceSize>,
             shuffle_id: u64,
             cur_bin_num: usize,
+            num_bins: usize,
             bin_size_in_bucket: usize,
         ) -> (Vec<A64Bytes<DataSize>>, Vec<A8Bytes<MetaSize>>)
         where
@@ -837,6 +971,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 seal_nonce,
                 shuffle_id,
                 cur_bin_num,
+                num_bins,
                 1,
                 &mut actual_bin_size,
                 &mut data,
@@ -878,6 +1013,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                         &seal_nonce,
                         shuffle_id,
                         cur_bin_num,
+                        num_bins,
                         bin_size_in_bucket,
                     )
                 } else {
@@ -887,6 +1023,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                         &seal_nonce,
                         shuffle_id,
                         cur_bin_num,
+                        num_bins,
                         bin_size_in_bucket,
                     )
                 };
@@ -1011,6 +1148,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                             &seal_nonce,
                             shuffle_id,
                             cur_bin_num,
+                            num_bins,
                             bin_size_in_bucket,
                         )
                     } else {
@@ -1020,6 +1158,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                             &seal_nonce,
                             shuffle_id,
                             cur_bin_num,
+                            num_bins,
                             bin_size_in_bucket,
                         )
                     };
@@ -1172,6 +1311,7 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
                 freshness_nonce,
                 shuffle_id,
                 first_real_bin,
+                num_bins,
                 0,
                 &mut 0,
                 &mut data,
@@ -1184,6 +1324,7 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
                 freshness_nonce,
                 shuffle_id,
                 first_real_bin,
+                num_bins,
                 0,
                 &mut 0,
                 &mut Vec::new(),
@@ -1197,6 +1338,7 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
                 freshness_nonce,
                 shuffle_id,
                 first_real_bin,
+                num_bins,
                 1,
                 &mut 0,
                 &mut Vec::new(),
@@ -1215,11 +1357,10 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
             &mut data,
             &mut meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
-        unsafe {
-            bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
-        }
+        helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
     } else {
         //oblivious random bin assignment
         oblivious_random_bin_assignment::<_, DataSize, MetaSize>(
@@ -1300,6 +1441,7 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         freshness_nonce,
                         shuffle_id,
                         first_real_bin + j_prime + j + c * pow_i,
+                        num_bins,
                         0,
                         &mut 0,
                         //for i == 0, dummy elements are padded by ourselves, not by loading
@@ -1313,6 +1455,7 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         freshness_nonce,
                         shuffle_id,
                         first_real_bin + j_prime + j + c * pow_i,
+                        num_bins,
                         0,
                         &mut 0,
                         &mut Vec::new(),
@@ -1336,6 +1479,7 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         freshness_nonce,
                         shuffle_id,
                         first_real_bin + j_prime + j + c * pow_i,
+                        num_bins,
                         1,
                         &mut 0,
                         &mut Vec::new(),
@@ -1359,6 +1503,7 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         freshness_nonce,
                         shuffle_id,
                         first_real_bin + j_prime + j + c * pow_i,
+                        num_bins,
                         1,
                         &mut 0,
                         &mut data[c * bin_size * has_data as usize
@@ -1415,6 +1560,7 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                         &mut meta[c * bin_size + (1 - c) * search_idx_left
                             ..(1 - c) * bin_size + c * search_idx_right],
                         &mut Vec::new(),
+                        num_bins,
                         rng,
                     );
                 }
@@ -1432,14 +1578,13 @@ fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
                             ..(c + 1) * bin_size * has_data as usize],
                         &mut meta[c * bin_size..(c + 1) * bin_size],
                         &mut random_keys[c * bin_size..(c + 1) * bin_size],
+                        num_bins,
                         rng,
                     );
                 }
             }
         }
-        unsafe {
-            bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
-        }
+        helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
         pow_i <<= 1;
     }
 }
@@ -1508,6 +1653,7 @@ fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
             freshness_nonce,
             shuffle_id,
             first_real_bin + cur_bin_num,
+            num_bins,
             1,
             &mut actual_bin_size,
             &mut data,
@@ -1541,6 +1687,7 @@ fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
                 &mut data,
                 &mut meta,
                 &mut Vec::new(),
+                num_bins,
                 rng,
             );
             cur_bin_num_new += 1;
@@ -1567,6 +1714,7 @@ fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
                 &mut acc_data,
                 &mut acc_meta,
                 &mut Vec::new(),
+                num_bins,
                 rng,
             );
             acc_meta = meta;
@@ -1575,9 +1723,7 @@ fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
             cur_bin_num_new += 1;
         }
     }
-    unsafe {
-        bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
-    }
+    helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
     assert_eq!(acc_meta.len(), 0);
     assert_eq!(cur_bin_num_new, num_bins);
 }
@@ -1683,6 +1829,7 @@ fn non_oblivious_merge_sort<Rng, DataSize, MetaSize>(
                 freshness_nonce,
                 shuffle_id,
                 first_real_bin,
+                num_bins,
                 &mut cur_bin_num_new,
                 key_by,
                 i,
@@ -1696,9 +1843,7 @@ fn non_oblivious_merge_sort<Rng, DataSize, MetaSize>(
         }
         assert_eq!(cur_bin_num_new, num_bins);
         width <<= 1;
-        unsafe {
-            bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
-        }
+        helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
     }
 }
 
@@ -1708,6 +1853,7 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
     freshness_nonce: &GenericArray<u8, NonceSize>,
     shuffle_id: u64,
     first_real_bin: usize,
+    num_bins: usize,
     cur_bin_num_new: &mut usize,
     key_by: usize,
     i_left: usize,
@@ -1743,6 +1889,7 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
             &freshness_nonce,
             shuffle_id,
             first_real_bin + cur_bin_num,
+            num_bins,
             1,
             &mut 0,
             &mut data[c * bin_size * has_data as usize..(c + 1) * bin_size * has_data as usize],
@@ -1776,6 +1923,7 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
                 &freshness_nonce,
                 shuffle_id,
                 first_real_bin + i_bin,
+                num_bins,
                 1,
                 &mut 0,
                 &mut data[..bin_size * has_data as usize],
@@ -1792,6 +1940,7 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
                 &freshness_nonce,
                 shuffle_id,
                 first_real_bin + j_bin,
+                num_bins,
                 1,
                 &mut 0,
                 &mut data[bin_size * has_data as usize..2 * bin_size * has_data as usize],
@@ -1827,6 +1976,7 @@ fn bottom_up_merge<Rng, DataSize, MetaSize>(
                 &mut sorted_data,
                 &mut sorted_meta,
                 &mut Vec::new(),
+                num_bins,
                 rng,
             );
             sorted_data.clear();
@@ -1917,6 +2067,7 @@ fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             &freshness_nonce,
             shuffle_id,
             cur_bin_num,
+            num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
@@ -1959,6 +2110,7 @@ fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             &mut Vec::new(),
             &mut meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
     }
@@ -1981,9 +2133,7 @@ fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
     nonce_buf.clone_from_slice(&nonce);
     hash_buf.clone_from_slice(&hash);
 
-    unsafe {
-        bin_switch(shuffle_id, 0, num_bins);
-    }
+    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
 }
 
 fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
@@ -2067,6 +2217,7 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             &mut data,
             &mut Vec::new(),
             &mut Vec::new(),
+            num_bins,
             rng,
         );
         push_bin::<_, DataSize, MetaSize>(
@@ -2079,6 +2230,7 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             &mut Vec::new(),
             &mut original_meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
 
@@ -2092,6 +2244,7 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             &mut Vec::new(),
             &mut meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
     }
@@ -2101,8 +2254,8 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
 
     unsafe {
         shuffle_release_tmp_posmap();
-        bin_switch(shuffle_id, 0, num_bins);
     }
+    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
 }
 
 pub fn oblivious_pull_trivial_posmap(data: &mut Vec<u32>) {
@@ -2184,6 +2337,7 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
             &freshness_nonce,
             shuffle_id,
             first_real_bin + cur_bin_num,
+            num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
@@ -2237,12 +2391,11 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
             &mut Vec::new(),
             &mut meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
     }
-    unsafe {
-        bin_switch(shuffle_id, first_real_bin, first_real_bin + num_bins);
-    }
+    helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
 }
 
 fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
@@ -2271,6 +2424,7 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
             &freshness_nonce,
             shuffle_id,
             cur_bin_num,
+            num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
@@ -2299,12 +2453,11 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
             &mut Vec::new(),
             &mut meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
     }
-    unsafe {
-        bin_switch(shuffle_id, 0, num_bins);
-    }
+    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
 }
 
 fn oblivious_placement<Rng, DataSize, MetaSize>(
@@ -2382,6 +2535,7 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
             freshness_nonce,
             shuffle_id,
             0,
+            num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
@@ -2406,11 +2560,10 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
             &mut Vec::new(),
             &mut meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
-        unsafe {
-            bin_switch(shuffle_id, 0, num_bins);
-        }
+        helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
     } else {
         let mut expected_new_idx = 0;
         let n = num_bins * bin_size;
@@ -2435,6 +2588,7 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
                             freshness_nonce,
                             shuffle_id,
                             cur_bin_num[c],
+                            num_bins,
                             1,
                             &mut 0,
                             &mut Vec::new(),
@@ -2488,14 +2642,13 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
                             &mut Vec::new(),
                             &mut meta[c * bin_size..(c + 1) * bin_size],
                             &mut Vec::new(),
+                            num_bins,
                             rng,
                         );
                     }
                 }
             }
-            unsafe {
-                bin_switch(shuffle_id, 0, num_bins);
-            }
+            helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
             k >>= 1;
         }
     }
@@ -2525,6 +2678,7 @@ fn patch_meta<Rng, DataSize, MetaSize>(
             &seal_nonce,
             shuffle_id,
             cur_bin_num,
+            num_bins,
             0,
             &mut 0,
             &mut Vec::new(),
@@ -2537,6 +2691,7 @@ fn patch_meta<Rng, DataSize, MetaSize>(
             &freshness_nonce,
             shuffle_id,
             cur_bin_num,
+            num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
@@ -2561,12 +2716,11 @@ fn patch_meta<Rng, DataSize, MetaSize>(
             &mut Vec::new(),
             &mut original_meta,
             &mut Vec::new(),
+            num_bins,
             rng,
         );
     }
-    unsafe {
-        bin_switch(shuffle_id, 0, num_bins);
-    }
+    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
 }
 
 fn shuffle_core<Rng, DataSize, MetaSize, Z>(
@@ -2927,6 +3081,19 @@ mod helpers {
             dst_hash_buf.copy_from_slice(hash);
 
             super::shuffle_push_bin(shuffle_id, cur_bin_num, bin_type);
+        }
+    }
+
+    pub fn bin_switch_ocall(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx: usize) {
+        let src_bins = SRC_BINS.read().unwrap();
+        let dst_bins = DST_BINS.read().unwrap();
+        for (i, bin) in dst_bins.iter().enumerate() {
+            let mut dst_bin = bin.lock().unwrap();
+            let mut src_bin = src_bins[i].lock().unwrap();
+            *src_bin = std::mem::take(&mut *dst_bin);
+        }
+        unsafe {
+            bin_switch(shuffle_id, begin_bin_idx, end_bin_idx);
         }
     }
 }

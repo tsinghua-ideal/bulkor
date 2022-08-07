@@ -68,7 +68,8 @@ lazy_static! {
     ///
     /// Changing this number influences any ORAM storage objects created after the change,
     /// but not before. So, it should normally be changed during enclave init, if at all.
-    pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(33u32); // 8 GB
+    /// And it should be consistent with the TREEMID_CACHING_THRESHOLD_LOG2 in oram_storage/mod.rs
+    pub static ref TREEMID_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(33u32); // 8 GB
 
     /// It is used to recover the already allocated ORAM tree
     /// by mapping the level id to oram pointer
@@ -177,7 +178,7 @@ struct UntrustedAllocation {
     /// The number of data and meta items stored in this allocation
     count_in_mem: usize,
     // The maximum count for the treetop storage in untrusted memory,
-    // based on what we loaded from TREETOP_CACHING_THRESHOLD_LOG2 at construction time
+    // based on what we loaded from TREEMID_CACHING_THRESHOLD_LOG2 at construction time
     // This must never change after construction.
     treetop_max_count: u64,
     /// The size of a data item in bytes
@@ -234,7 +235,7 @@ impl UntrustedAllocation {
     ) -> Self {
         let treetop_max_count: u64 = max(
             2u64,
-            (1u64 << TREETOP_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) / data_item_size as u64,
+            (1u64 << TREEMID_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) / data_item_size as u64,
         );
         let count_in_mem = if count <= treetop_max_count as usize {
             count
