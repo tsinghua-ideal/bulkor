@@ -3,7 +3,11 @@ use std::fs::{self, remove_file, rename, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc, Mutex};
+
+// Should be consistent with oram_storage/shuffle_manager.rs
+const NUM_THREADS: usize = 8;
+
 pub struct ShuffleManager {
     pub storage_id: u64,
     data_size: usize, //Bucket data
@@ -12,23 +16,23 @@ pub struct ShuffleManager {
     num_bins_on_disk: usize,
     //after separation or before combination
     //denoted as idle bins
-    data_bin_buf: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
-    meta_bin_buf: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
-    data_bin_file_idx: Vec<u64>,
-    meta_bin_file_idx: Vec<u64>,
+    data_bin_buf: Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>)>>>,
+    meta_bin_buf: Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>)>>>,
+    data_bin_size: u64,
+    meta_bin_size: u64,
     data_bin_file: File,
     meta_bin_file: File,
     //bins used during shuffle
     //denoted as work bins
-    //bin format: (data, meta, random_keys, nonce, hash)
-    src_bins: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>,
-    dst_bins: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>,
-    src_bin_file_idx: Vec<u64>,
-    dst_bin_file_idx: Vec<u64>,
+    //bin format: (data, meta, nonce, hash)
+    src_bins: Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>>>,
+    dst_bins: Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>>>,
+    src_bin_size: u64,
+    dst_bin_size: u64,
     src_bin_file: File,
     dst_bin_file: File,
     //temp buf
-    pub tmp_buf: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    pub tmp_buf: Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>>>,
 }
 
 impl ShuffleManager {
@@ -40,6 +44,23 @@ impl ShuffleManager {
         in_memory_ratio: usize,
     ) -> Self {
         let num_bins_on_disk = num_bins - ((num_bins - 1) / in_memory_ratio + 1);
+
+        let mut data_bin_buf = Vec::new();
+        data_bin_buf.resize_with(num_bins - num_bins_on_disk, || {
+            Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new())))
+        });
+        let mut meta_bin_buf = Vec::new();
+        meta_bin_buf.resize_with(num_bins - num_bins_on_disk, || {
+            Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new())))
+        });
+        let mut src_bins = Vec::new();
+        src_bins.resize_with(num_bins - num_bins_on_disk, || {
+            Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())))
+        });
+        let mut dst_bins = Vec::new();
+        dst_bins.resize_with(num_bins - num_bins_on_disk, || {
+            Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())))
+        });
 
         let data_bin_file_name = PathBuf::from("shuffle_data_bin");
         let meta_bin_file_name = PathBuf::from("shuffle_meta_bin");
@@ -71,25 +92,30 @@ impl ShuffleManager {
             .open(&dst_bin_file_name)
             .unwrap();
 
+        let mut tmp_buf = Vec::new();
+        tmp_buf.resize_with(NUM_THREADS, || {
+            Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())))
+        });
+
         ShuffleManager {
             storage_id,
             data_size,
             meta_size,
             num_bins,
             num_bins_on_disk,
-            data_bin_buf: vec![Default::default(); num_bins - num_bins_on_disk],
-            meta_bin_buf: vec![Default::default(); num_bins - num_bins_on_disk],
-            data_bin_file_idx: vec![u64::MAX; num_bins_on_disk],
-            meta_bin_file_idx: vec![u64::MAX; num_bins_on_disk],
+            data_bin_buf,
+            meta_bin_buf,
+            data_bin_size: 0,
+            meta_bin_size: 0,
             data_bin_file,
             meta_bin_file,
-            src_bins: vec![Default::default(); num_bins - num_bins_on_disk],
-            dst_bins: vec![Default::default(); num_bins - num_bins_on_disk],
-            src_bin_file_idx: vec![u64::MAX; num_bins_on_disk],
-            dst_bin_file_idx: vec![u64::MAX; num_bins_on_disk],
+            src_bins,
+            dst_bins,
+            src_bin_size: 0,
+            dst_bin_size: 0,
             src_bin_file,
             dst_bin_file,
-            tmp_buf: Default::default(),
+            tmp_buf,
         }
     }
 
@@ -97,9 +123,6 @@ impl ShuffleManager {
         //sometimes the user-space allocator would not return the memory to OS, causing the memory overflow.
         let release_mem = unsafe { libc::malloc_trim(0) };
         println!("release the memory successfully? {:?}", release_mem == 1);
-
-        self.data_bin_file_idx.clear();
-        self.meta_bin_file_idx.clear();
     }
 
     pub fn pull_buckets(&mut self, b_idx: usize, e_idx: usize, data: &mut [u8], meta: &mut [u8]) {
@@ -161,7 +184,8 @@ impl ShuffleManager {
     }
 
     pub fn pull_bin(
-        &mut self,
+        &self,
+        tid: usize,
         cur_bin_num: usize,
         bin_type: u8,
         bin_size: &mut usize,
@@ -169,7 +193,6 @@ impl ShuffleManager {
         meta_item_size: usize,
         has_data: bool,
         has_meta: bool,
-        has_random_key: bool,
         nonce_size: usize,
         hash_size: usize,
     ) {
@@ -178,11 +201,10 @@ impl ShuffleManager {
         let mut hash = vec![0; hash_size];
 
         if bin_type == 0 {
-            assert!(!has_random_key);
             assert!(!has_meta && has_data || has_meta && !has_data);
             if cur_bin_num < self.num_bins_on_disk {
                 if has_data {
-                    let mut offset = self.data_bin_file_idx[cur_bin_num];
+                    let mut offset = self.data_bin_size * cur_bin_num as u64;
                     let mut data_size_buf = [0u8; 8];
                     self.data_bin_file
                         .read_exact_at(&mut data_size_buf, offset)
@@ -198,9 +220,9 @@ impl ShuffleManager {
                         .unwrap();
                     offset += nonce_size as u64;
                     self.data_bin_file.read_exact_at(&mut hash, offset).unwrap();
-                    self.tmp_buf = (data, Vec::new(), Vec::new(), nonce, hash);
+                    *self.tmp_buf[tid].lock().unwrap() = (data, Vec::new(), nonce, hash);
                 } else {
-                    let mut offset = self.meta_bin_file_idx[cur_bin_num];
+                    let mut offset = self.meta_bin_size * cur_bin_num as u64;
                     let mut meta_size_buf = [0u8; 8];
                     self.meta_bin_file
                         .read_exact_at(&mut meta_size_buf, offset)
@@ -216,30 +238,35 @@ impl ShuffleManager {
                         .unwrap();
                     offset += nonce_size as u64;
                     self.meta_bin_file.read_exact_at(&mut hash, offset).unwrap();
-                    self.tmp_buf = (Vec::new(), meta, Vec::new(), nonce, hash);
+                    *self.tmp_buf[tid].lock().unwrap() = (Vec::new(), meta, nonce, hash);
                 }
             } else {
                 if has_data {
-                    let (data, nonce, hash) =
-                        std::mem::take(&mut self.data_bin_buf[cur_bin_num - self.num_bins_on_disk]);
+                    let (data, nonce, hash) = std::mem::take(
+                        &mut *self.data_bin_buf[cur_bin_num - self.num_bins_on_disk]
+                            .lock()
+                            .unwrap(),
+                    );
                     let actual_data_size = data.len();
                     *bin_size = actual_data_size / data_item_size;
-                    self.tmp_buf = (data, Vec::new(), Vec::new(), nonce, hash);
+                    *self.tmp_buf[tid].lock().unwrap() = (data, Vec::new(), nonce, hash);
                 } else {
-                    let (meta, nonce, hash) =
-                        std::mem::take(&mut self.meta_bin_buf[cur_bin_num - self.num_bins_on_disk]);
+                    let (meta, nonce, hash) = std::mem::take(
+                        &mut *self.meta_bin_buf[cur_bin_num - self.num_bins_on_disk]
+                            .lock()
+                            .unwrap(),
+                    );
                     let actual_meta_size = meta.len();
                     *bin_size = actual_meta_size / meta_item_size;
-                    self.tmp_buf = (Vec::new(), meta, Vec::new(), nonce, hash);
+                    *self.tmp_buf[tid].lock().unwrap() = (Vec::new(), meta, nonce, hash);
                 }
             }
         } else if bin_type == 1 {
             assert!(has_meta);
             if cur_bin_num < self.num_bins_on_disk {
-                let mut offset = self.src_bin_file_idx[cur_bin_num];
+                let mut offset = self.src_bin_size * cur_bin_num as u64;
                 let mut data_size_buf = [0u8; 8];
                 let mut meta_size_buf = [0u8; 8];
-                let mut random_key_size_buf = [0u8; 8];
                 self.src_bin_file
                     .read_exact_at(&mut data_size_buf, offset)
                     .unwrap();
@@ -250,48 +277,41 @@ impl ShuffleManager {
                     .unwrap();
                 offset += 8;
                 let actual_meta_size = usize::from_ne_bytes(meta_size_buf);
-                self.src_bin_file
-                    .read_exact_at(&mut random_key_size_buf, offset)
-                    .unwrap();
-                offset += 8;
-                let actual_random_key_size = usize::from_ne_bytes(random_key_size_buf);
                 *bin_size = actual_meta_size / meta_item_size;
                 assert!(has_data == (actual_data_size != 0));
                 assert!(has_meta == (actual_meta_size != 0));
-                assert!(has_random_key == (actual_random_key_size != 0));
                 let mut data = vec![0; actual_data_size];
                 self.src_bin_file.read_exact_at(&mut data, offset).unwrap();
                 offset += actual_data_size as u64;
                 let mut meta = vec![0; actual_meta_size];
                 self.src_bin_file.read_exact_at(&mut meta, offset).unwrap();
                 offset += actual_meta_size as u64;
-                let mut random_keys = vec![0; actual_random_key_size];
-                self.src_bin_file
-                    .read_exact_at(&mut random_keys, offset)
-                    .unwrap();
-                offset += actual_random_key_size as u64;
                 self.src_bin_file.read_exact_at(&mut nonce, offset).unwrap();
                 offset += nonce_size as u64;
                 self.src_bin_file.read_exact_at(&mut hash, offset).unwrap();
-                self.tmp_buf = (data, meta, random_keys, nonce, hash);
+                *self.tmp_buf[tid].lock().unwrap() = (data, meta, nonce, hash);
             } else {
-                let t = std::mem::take(&mut self.src_bins[cur_bin_num - self.num_bins_on_disk]);
+                let t = std::mem::take(
+                    &mut *self.src_bins[cur_bin_num - self.num_bins_on_disk]
+                        .lock()
+                        .unwrap(),
+                );
                 *bin_size = t.1.len() / meta_item_size;
-                self.tmp_buf = t;
+                *self.tmp_buf[tid].lock().unwrap() = t;
             }
         } else {
             unreachable!()
         }
     }
 
-    pub fn push_buckets(&mut self, b_idx: usize, e_idx: usize) {
+    pub fn push_buckets(&mut self, tid: usize, b_idx: usize, e_idx: usize) {
         let storage = unsafe {
             core::mem::transmute::<_, *mut UntrustedAllocation>(self.storage_id)
                 .as_mut()
                 .unwrap()
         };
 
-        let (data, meta, _, _, _) = std::mem::take(&mut self.tmp_buf);
+        let (data, meta, _, _) = std::mem::take(&mut *self.tmp_buf[tid].lock().unwrap());
         let data_size = data.len();
         let meta_size = meta.len();
         assert_eq!(data_size / self.data_size, meta_size / self.meta_size);
@@ -362,97 +382,110 @@ impl ShuffleManager {
         }
     }
 
-    pub fn push_bin(&mut self, cur_bin_num: usize, bin_type: u8) {
+    pub fn push_bin(&mut self, tid: usize, cur_bin_num: usize, bin_type: u8) {
         assert!(cur_bin_num < self.num_bins);
-        let (data, meta, random_key, nonce, hash) = std::mem::take(&mut self.tmp_buf);
+        let (data, meta, nonce, hash) = std::mem::take(&mut *self.tmp_buf[tid].lock().unwrap());
         let data_size = data.len();
         let meta_size = meta.len();
-        let random_key_size = random_key.len();
         if bin_type == 0 {
-            assert_eq!(random_key_size, 0);
             assert!(meta_size == 0 && data_size > 0 || meta_size > 0 && data_size == 0);
             if cur_bin_num < self.num_bins_on_disk {
                 if data_size > 0 {
-                    if self.data_bin_file_idx[cur_bin_num] == u64::MAX {
-                        self.data_bin_file_idx[cur_bin_num] =
-                            self.data_bin_file.seek(SeekFrom::End(0)).unwrap();
-                    }
+                    let mut offset = self.data_bin_size * cur_bin_num as u64;
                     self.data_bin_file
-                        .write_all(&(data_size).to_ne_bytes())
+                        .write_at(&(data_size).to_ne_bytes(), offset)
                         .unwrap();
-                    self.data_bin_file.write_all(&data).unwrap();
-                    self.data_bin_file.write_all(&nonce).unwrap();
-                    self.data_bin_file.write_all(&hash).unwrap();
+                    offset += 8;
+                    self.data_bin_file.write_at(&data, offset).unwrap();
+                    offset += data.len() as u64;
+                    self.data_bin_file.write_at(&nonce, offset).unwrap();
+                    offset += nonce.len() as u64;
+                    self.data_bin_file.write_at(&hash, offset).unwrap();
                 } else {
-                    if self.meta_bin_file_idx[cur_bin_num] == u64::MAX {
-                        self.meta_bin_file_idx[cur_bin_num] =
-                            self.meta_bin_file.seek(SeekFrom::End(0)).unwrap();
-                    }
+                    let mut offset = self.meta_bin_size * cur_bin_num as u64;
                     self.meta_bin_file
-                        .write_all(&(meta_size).to_ne_bytes())
+                        .write_at(&(meta_size).to_ne_bytes(), offset)
                         .unwrap();
-                    self.meta_bin_file.write_all(&meta).unwrap();
-                    self.meta_bin_file.write_all(&nonce).unwrap();
-                    self.meta_bin_file.write_all(&hash).unwrap();
+                    offset += 8;
+                    self.meta_bin_file.write_at(&meta, offset).unwrap();
+                    offset += meta.len() as u64;
+                    self.meta_bin_file.write_at(&nonce, offset).unwrap();
+                    offset += nonce.len() as u64;
+                    self.meta_bin_file.write_at(&hash, offset).unwrap();
                 }
             } else {
                 if data_size > 0 {
-                    self.data_bin_buf[cur_bin_num - self.num_bins_on_disk] = (data, nonce, hash);
+                    *self.data_bin_buf[cur_bin_num - self.num_bins_on_disk]
+                        .lock()
+                        .unwrap() = (data, nonce, hash);
                 } else {
-                    self.meta_bin_buf[cur_bin_num - self.num_bins_on_disk] = (meta, nonce, hash);
+                    *self.meta_bin_buf[cur_bin_num - self.num_bins_on_disk]
+                        .lock()
+                        .unwrap() = (meta, nonce, hash);
                 }
             }
         } else if bin_type == 1 {
             if cur_bin_num < self.num_bins_on_disk {
                 //if dst_bin_file_idx is reset in bin_switch, the assertion should be true
                 //assert_eq!(self.dst_bin_file_idx[cur_bin_num], u64::MAX);
-                self.dst_bin_file_idx[cur_bin_num] =
-                    self.dst_bin_file.seek(SeekFrom::Current(0)).unwrap();
+                let mut offset = self.dst_bin_size * cur_bin_num as u64;
                 self.dst_bin_file
-                    .write_all(&(data_size).to_ne_bytes())
+                    .write_at(&(data_size).to_ne_bytes(), offset)
                     .unwrap();
+                offset += 8;
                 self.dst_bin_file
-                    .write_all(&(meta_size).to_ne_bytes())
+                    .write_at(&(meta_size).to_ne_bytes(), offset)
                     .unwrap();
-                self.dst_bin_file
-                    .write_all(&(random_key_size).to_ne_bytes())
-                    .unwrap();
-                self.dst_bin_file.write_all(&data).unwrap();
-                self.dst_bin_file.write_all(&meta).unwrap();
-                self.dst_bin_file.write_all(&random_key).unwrap();
-                self.dst_bin_file.write_all(&nonce).unwrap();
-                self.dst_bin_file.write_all(&hash).unwrap();
+                offset += 8;
+                self.dst_bin_file.write_at(&data, offset).unwrap();
+                offset += data.len() as u64;
+                self.dst_bin_file.write_at(&meta, offset).unwrap();
+                offset += meta.len() as u64;
+                self.dst_bin_file.write_at(&nonce, offset).unwrap();
+                offset += nonce.len() as u64;
+                self.dst_bin_file.write_at(&hash, offset).unwrap();
             } else {
-                self.dst_bins[cur_bin_num - self.num_bins_on_disk] =
-                    (data, meta, random_key, nonce, hash);
+                *self.dst_bins[cur_bin_num - self.num_bins_on_disk]
+                    .lock()
+                    .unwrap() = (data, meta, nonce, hash);
             }
         } else {
             unreachable!()
         }
     }
 
-    pub fn bin_switch(&mut self, begin_bin_idx: usize, end_bin_idx: usize) {
-        assert_eq!(end_bin_idx - begin_bin_idx, self.num_bins);
+    pub fn bin_switch(&mut self) {
         //reset file pointer
         rename("shuffle_src_bin", "shuffle_src_bin_del").unwrap();
         rename("shuffle_dst_bin", "shuffle_src_bin").unwrap();
         std::mem::swap(&mut self.src_bin_file, &mut self.dst_bin_file);
-        self.src_bin_file_idx = std::mem::take(&mut self.dst_bin_file_idx);
-        self.dst_bin_file_idx = vec![u64::MAX; self.num_bins_on_disk];
         self.dst_bin_file = OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
             .open(&"shuffle_dst_bin")
             .unwrap();
-        self.src_bin_file.seek(SeekFrom::Start(0)).unwrap();
         remove_file("shuffle_src_bin_del").unwrap();
 
-        for idx in begin_bin_idx..end_bin_idx {
+        for idx in 0..self.num_bins {
             if idx >= self.num_bins_on_disk {
-                self.src_bins[idx - self.num_bins_on_disk] =
-                    std::mem::take(&mut self.dst_bins[idx - self.num_bins_on_disk]);
+                *self.src_bins[idx - self.num_bins_on_disk].lock().unwrap() = std::mem::take(
+                    &mut *self.dst_bins[idx - self.num_bins_on_disk].lock().unwrap(),
+                );
             }
         }
+    }
+
+    pub fn set_fixed_bin_size(
+        &mut self,
+        data_bin_size: u64,
+        meta_bin_size: u64,
+        src_bin_size: u64,
+        dst_bin_size: u64,
+    ) {
+        self.data_bin_size = data_bin_size;
+        self.meta_bin_size = meta_bin_size;
+        self.src_bin_size = src_bin_size;
+        self.dst_bin_size = dst_bin_size;
     }
 }

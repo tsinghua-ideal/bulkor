@@ -68,7 +68,8 @@ lazy_static! {
     ///
     /// Changing this number influences any ORAM storage objects created after the change,
     /// but not before. So, it should normally be changed during enclave init, if at all.
-    pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(33u32); // 8 GB
+    /// And it should be consistent with the TREEMID_CACHING_THRESHOLD_LOG2 in oram_storage/mod.rs
+    pub static ref TREEMID_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(33u32); // 8 GB
 
     /// It is used to recover the already allocated ORAM tree
     /// by mapping the level id to oram pointer
@@ -177,7 +178,7 @@ struct UntrustedAllocation {
     /// The number of data and meta items stored in this allocation
     count_in_mem: usize,
     // The maximum count for the treetop storage in untrusted memory,
-    // based on what we loaded from TREETOP_CACHING_THRESHOLD_LOG2 at construction time
+    // based on what we loaded from TREEMID_CACHING_THRESHOLD_LOG2 at construction time
     // This must never change after construction.
     treetop_max_count: u64,
     /// The size of a data item in bytes
@@ -234,7 +235,7 @@ impl UntrustedAllocation {
     ) -> Self {
         let treetop_max_count: u64 = max(
             2u64,
-            (1u64 << TREETOP_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) / data_item_size as u64,
+            (1u64 << TREEMID_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) / data_item_size as u64,
         );
         let count_in_mem = if count <= treetop_max_count as usize {
             count
@@ -1412,6 +1413,7 @@ pub extern "C" fn shuffle_pull_buckets(
 #[no_mangle]
 pub extern "C" fn shuffle_pull_bin(
     shuffle_id: u64,
+    tid: usize,
     cur_bin_num: usize,
     bin_type: u8,
     bin_size: *mut usize,
@@ -1419,12 +1421,10 @@ pub extern "C" fn shuffle_pull_bin(
     meta_item_size: usize,
     has_data: u8,
     has_meta: u8,
-    has_random_key: u8,
     nonce_size: usize,
     hash_size: usize,
     data_ptr: *mut usize,
     meta_ptr: *mut usize,
-    random_key_ptr: *mut usize,
     nonce_ptr: *mut usize,
     hash_ptr: *mut usize,
 ) {
@@ -1437,6 +1437,7 @@ pub extern "C" fn shuffle_pull_bin(
     //TODO: may need lock
     let bin_size = unsafe { bin_size.as_mut().unwrap() };
     manager.pull_bin(
+        tid,
         cur_bin_num,
         bin_type,
         bin_size,
@@ -1444,22 +1445,22 @@ pub extern "C" fn shuffle_pull_bin(
         meta_item_size,
         has_data != 0,
         has_meta != 0,
-        has_random_key != 0,
         nonce_size,
         hash_size,
     );
+    let mut tmp_buf = manager.tmp_buf[tid].lock().unwrap();
     unsafe {
-        *data_ptr = (&mut manager.tmp_buf.0) as *mut Vec<u8> as usize;
-        *meta_ptr = (&mut manager.tmp_buf.1) as *mut Vec<u8> as usize;
-        *random_key_ptr = (&mut manager.tmp_buf.2) as *mut Vec<u8> as usize;
-        *nonce_ptr = (&mut manager.tmp_buf.3) as *mut Vec<u8> as usize;
-        *hash_ptr = (&mut manager.tmp_buf.4) as *mut Vec<u8> as usize;
+        *data_ptr = (&mut tmp_buf.0) as *mut Vec<u8> as usize;
+        *meta_ptr = (&mut tmp_buf.1) as *mut Vec<u8> as usize;
+        *nonce_ptr = (&mut tmp_buf.2) as *mut Vec<u8> as usize;
+        *hash_ptr = (&mut tmp_buf.3) as *mut Vec<u8> as usize;
     }
 }
 
 #[no_mangle]
 pub extern "C" fn shuffle_push_buckets_pre(
     shuffle_id: u64,
+    tid: usize,
     data_size: usize,
     meta_size: usize,
     data_ptr: *mut usize,
@@ -1471,21 +1472,21 @@ pub extern "C" fn shuffle_push_buckets_pre(
             .as_mut()
             .unwrap()
     };
-    manager.tmp_buf = (
+    let mut tmp_buf = manager.tmp_buf[tid].lock().unwrap();
+    *tmp_buf = (
         vec![0u8; data_size],
         vec![0u8; meta_size],
         Vec::new(),
         Vec::new(),
-        Vec::new(),
     );
     unsafe {
-        *data_ptr = (&mut manager.tmp_buf.0) as *mut Vec<u8> as usize;
-        *meta_ptr = (&mut manager.tmp_buf.1) as *mut Vec<u8> as usize;
+        *data_ptr = (&mut tmp_buf.0) as *mut Vec<u8> as usize;
+        *meta_ptr = (&mut tmp_buf.1) as *mut Vec<u8> as usize;
     }
 }
 
 #[no_mangle]
-pub extern "C" fn shuffle_push_buckets(shuffle_id: u64, b_idx: usize, e_idx: usize) {
+pub extern "C" fn shuffle_push_buckets(shuffle_id: u64, tid: usize, b_idx: usize, e_idx: usize) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
         (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
@@ -1493,20 +1494,19 @@ pub extern "C" fn shuffle_push_buckets(shuffle_id: u64, b_idx: usize, e_idx: usi
             .unwrap()
     };
     //TODO: may need lock
-    manager.push_buckets(b_idx, e_idx);
+    manager.push_buckets(tid, b_idx, e_idx);
 }
 
 #[no_mangle]
 pub extern "C" fn shuffle_push_bin_pre(
     shuffle_id: u64,
+    tid: usize,
     data_size: usize,
     meta_size: usize,
-    random_key_size: usize,
     nonce_size: usize,
     hash_size: usize,
     data_ptr: *mut usize,
     meta_ptr: *mut usize,
-    random_key_ptr: *mut usize,
     nonce_ptr: *mut usize,
     hash_ptr: *mut usize,
 ) {
@@ -1516,24 +1516,23 @@ pub extern "C" fn shuffle_push_bin_pre(
             .as_mut()
             .unwrap()
     };
-    manager.tmp_buf = (
+    let mut tmp_buf = manager.tmp_buf[tid].lock().unwrap();
+    *tmp_buf = (
         vec![0u8; data_size],
         vec![0u8; meta_size],
-        vec![0u8; random_key_size],
         vec![0u8; nonce_size],
         vec![0u8; hash_size],
     );
     unsafe {
-        *data_ptr = (&mut manager.tmp_buf.0) as *mut Vec<u8> as usize;
-        *meta_ptr = (&mut manager.tmp_buf.1) as *mut Vec<u8> as usize;
-        *random_key_ptr = (&mut manager.tmp_buf.2) as *mut Vec<u8> as usize;
-        *nonce_ptr = (&mut manager.tmp_buf.3) as *mut Vec<u8> as usize;
-        *hash_ptr = (&mut manager.tmp_buf.4) as *mut Vec<u8> as usize;
+        *data_ptr = (&mut tmp_buf.0) as *mut Vec<u8> as usize;
+        *meta_ptr = (&mut tmp_buf.1) as *mut Vec<u8> as usize;
+        *nonce_ptr = (&mut tmp_buf.2) as *mut Vec<u8> as usize;
+        *hash_ptr = (&mut tmp_buf.3) as *mut Vec<u8> as usize;
     }
 }
 
 #[no_mangle]
-pub extern "C" fn shuffle_push_bin(shuffle_id: u64, cur_bin_num: usize, bin_type: u8) {
+pub extern "C" fn shuffle_push_bin(shuffle_id: u64, tid: usize, cur_bin_num: usize, bin_type: u8) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
         (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
@@ -1541,7 +1540,7 @@ pub extern "C" fn shuffle_push_bin(shuffle_id: u64, cur_bin_num: usize, bin_type
             .unwrap()
     };
     //TODO: may need lock
-    manager.push_bin(cur_bin_num, bin_type);
+    manager.push_bin(tid, cur_bin_num, bin_type);
 }
 
 #[no_mangle]
@@ -1583,7 +1582,7 @@ pub extern "C" fn shuffle_release_tmp_posmap() {
 }
 
 #[no_mangle]
-pub extern "C" fn bin_switch(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx: usize) {
+pub extern "C" fn bin_switch(shuffle_id: u64) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
         (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
@@ -1591,7 +1590,25 @@ pub extern "C" fn bin_switch(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx:
             .unwrap()
     };
     //TODO: may need lock
-    manager.bin_switch(begin_bin_idx, end_bin_idx);
+    manager.bin_switch();
+}
+
+#[no_mangle]
+pub extern "C" fn set_fixed_bin_size(
+    shuffle_id: u64,
+    data_bin_size: u64,
+    meta_bin_size: u64,
+    src_bin_size: u64,
+    dst_bin_size: u64,
+) {
+    assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
+    let manager = unsafe {
+        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
+            .as_mut()
+            .unwrap()
+    };
+    //TODO: may need lock
+    manager.set_fixed_bin_size(data_bin_size, meta_bin_size, src_bin_size, dst_bin_size);
 }
 
 #[no_mangle]
