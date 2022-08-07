@@ -11,6 +11,7 @@ use crate::{NonceSize, IS_LATEST, LIFETIME_ID, SNAPSHOT_ID};
 
 use aligned_cmov::{typenum::Unsigned, Aligned};
 use balanced_tree_index::TreeIndex;
+use std::boxed::Box;
 use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
@@ -41,20 +42,29 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
         if snapshot_id > 0 && (is_latest || level == 0) {
             let ns = NonceSize::USIZE;
             let data_len = ns + 16 + 8 + 4 + 8 + size as usize * BlockSize::USIZE;
-            let mut data_buf = vec![0 as u8; data_len];
             let meta_len = ns + 16 + 8 + 4 + 8 + size as usize * MetaSize::USIZE;
-            let mut meta_buf = vec![0 as u8; meta_len];
+            crate::ALLOCATOR.set_switch(true);
+            let mut data_buf_ut = vec![0 as u8; data_len];
+            let mut meta_buf_ut = vec![0 as u8; meta_len];
+            crate::ALLOCATOR.set_switch(false);
 
             unsafe {
                 recover_treetop(
-                    data_buf.as_mut_ptr(),
+                    data_buf_ut.as_mut_ptr(),
                     data_len,
-                    meta_buf.as_mut_ptr(),
+                    meta_buf_ut.as_mut_ptr(),
                     meta_len,
                     level,
                     snapshot_id,
                 );
             }
+
+            let mut data_buf = data_buf_ut.clone();
+            let mut meta_buf = meta_buf_ut.clone();
+            crate::ALLOCATOR.set_switch(true);
+            drop(data_buf_ut);
+            drop(meta_buf_ut);
+            crate::ALLOCATOR.set_switch(false);
 
             s_decrypt(&ORAM_KEY, &mut data_buf, 20);
             s_decrypt(&ORAM_KEY, &mut meta_buf, 20);
@@ -179,6 +189,11 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
         s_encrypt(&ORAM_KEY, &mut data, 20, rng);
         s_encrypt(&ORAM_KEY, &mut meta, 20, rng);
 
+        crate::ALLOCATOR.set_switch(true);
+        let data = data.clone();
+        let meta = meta.clone();
+        crate::ALLOCATOR.set_switch(false);
+
         // TODO: the ocall should not stall the steps after it
         unsafe {
             persist_treetop(
@@ -191,6 +206,11 @@ impl<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned>
                 volatile as u8,
             )
         }
+
+        crate::ALLOCATOR.set_switch(true);
+        drop(data);
+        drop(meta);
+        crate::ALLOCATOR.set_switch(false);
     }
 }
 
