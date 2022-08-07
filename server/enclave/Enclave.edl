@@ -194,9 +194,9 @@ enclave {
 
         /// Persist the treetop, and save to files if necessary
         /// 
-        void persist_treetop([in, count=new_data_len] const uint8_t * new_data,
+        void persist_treetop([user_check] const uint8_t * new_data,
                             size_t new_data_len,
-                            [in, count=new_meta_len] const uint8_t * new_meta,
+                            [user_check] const uint8_t * new_meta,
                             size_t new_meta_len, 
                             uint32_t level, 
                             uint64_t new_snapshot_id,
@@ -204,9 +204,9 @@ enclave {
         
         /// Recover the treetop
         /// 
-        void recover_treetop([out, count=data_len] uint8_t * data,
+        void recover_treetop([user_check] uint8_t * data,
                             size_t data_len,
-                            [out, count=meta_len] uint8_t * meta,
+                            [user_check] uint8_t * meta,
                             size_t meta_len,
                             uint32_t level, 
                             uint64_t snapshot_id); 
