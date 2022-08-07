@@ -249,6 +249,7 @@ enclave {
             size_t meta_size);
 
         void shuffle_pull_bin(uint64_t shuffle_id,
+            size_t tid,
             size_t cur_bin_num,
             uint8_t bin_type,
             [out] size_t * bin_size,
@@ -256,38 +257,38 @@ enclave {
             size_t meta_item_size,
             uint8_t has_data,
             uint8_t has_meta,
-            uint8_t has_random_key,
             size_t nonce_size,
             size_t hash_size,
             [out] size_t * data_ptr,
             [out] size_t * meta_ptr,
-            [out] size_t * random_key_ptr,
             [out] size_t * nonce_ptr,
             [out] size_t * hash_ptr);
 
         void shuffle_push_buckets_pre(uint64_t shuffle_id,
+            size_t tid,
             size_t data_size,
             size_t meta_size,
             [out] size_t * data_ptr,
             [out] size_t * meta_ptr);
 
         void shuffle_push_buckets(uint64_t shuffle_id,
+            size_t tid,
             size_t b_idx,
             size_t e_idx);
         
         void shuffle_push_bin_pre(uint64_t shuffle_id,
+            size_t tid,
             size_t data_size,
             size_t meta_size,
-            size_t random_key_size,
             size_t nonce_size,
             size_t hash_size,
             [out] size_t * data_ptr,
             [out] size_t * meta_ptr,
-            [out] size_t * random_key_ptr,
             [out] size_t * nonce_ptr,
             [out] size_t * hash_ptr);
 
         void shuffle_push_bin(uint64_t shuffle_id,
+            size_t tid,
             size_t cur_bin_num,
             uint8_t bin_type);
 
@@ -304,7 +305,9 @@ enclave {
 
         void shuffle_release_tmp_posmap();
 
-        void bin_switch(uint64_t shuffle_id, size_t begin_bin_idx, size_t end_bin_idx);
+        void bin_switch(uint64_t shuffle_id);
+
+        void set_fixed_bin_size(uint64_t shuffle_id, uint64_t data_bin_size, uint64_t meta_bin_size, uint64_t src_bin_size, uint64_t dst_bin_size);
 
         void clear_content(uint64_t shuffle_id);
 

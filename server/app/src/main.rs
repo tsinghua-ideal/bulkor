@@ -121,6 +121,7 @@ fn init_enclave_and_oram(n: u64) -> (SgxEnclave, u64, Vec<Vec<u8>>) {
     log::info!("Enclave intialization finished.");
     let eid = enclave.geteid();
 
+    let now = Instant::now();
     let mut retval = n;
     let mut results_ptr = 0;
     let result_code = unsafe { ecall_create_oram(eid, &mut retval, n, &mut results_ptr) };
@@ -138,6 +139,8 @@ fn init_enclave_and_oram(n: u64) -> (SgxEnclave, u64, Vec<Vec<u8>>) {
         .collect::<Vec<_>>();
     std::mem::forget(results_in_enclave);
     unsafe { ecall_release_results_space(eid, results_ptr) };
+    let dur = now.elapsed().as_nanos() as f64 * 1e-9;
+    println!("init n = {:?} 1KB blocks cost {:?} s", n, dur);
 
     (enclave, eid, results)
 }
@@ -307,15 +310,14 @@ fn main() {
     logger::initialize_loggers(base_dir.join("running.log"), LogLevel::Info);
 
     let n = 16 << 10; //16K*1KB
-    let now = Instant::now();
     let (enclave, eid, remaining_results) = init_enclave_and_oram(n);
-
+    let now = Instant::now();
     //serve(enclave, eid, n, remaining_results);
     //exercise_oram(10000, n, eid);
     exercise_oram_consecutive(n as usize, n, eid);
     //sanity_check(eid);
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
-    println!("shuffle n = {:?} 1KB blocks cost {:?} s", n, dur);
+    println!("insert n = {:?} 1KB blocks cost {:?} s", n, dur);
 
     enclave.destroy();
     release_all_oram_storage();
