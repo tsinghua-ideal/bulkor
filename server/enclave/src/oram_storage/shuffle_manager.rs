@@ -2,7 +2,8 @@ use crate::oram_manager::{DataMetaSize, PosMetaSize};
 use crate::oram_storage::{
     compute_block_hash, make_aes_nonce, ExtraMeta, ExtraMetaSize, Hash, IN_ENCLAVE_RATIO,
 };
-use crate::oram_traits::{log2_ceil, HeapORAMStorage};
+use crate::oram_traits::{log2_ceil, rng_maker, HeapORAMStorage};
+use crate::test_helper::get_seeded_rng;
 use crate::{AuthCipherType, AuthNonceSize, CipherType, KeySize, NonceSize, ALLOCATOR};
 use aes::cipher::{NewCipher, StreamCipher};
 use aligned_cmov::{
@@ -14,19 +15,22 @@ use aligned_cmov::{
 use blake2::{digest::Digest, Blake2b};
 use rand_core::{CryptoRng, RngCore};
 use sgx_trts::trts::rsgx_read_rand;
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 use std::ops::{Add, Deref, Div, Mul};
-use std::sync::{Arc, SgxMutex as Mutex, SgxRwLock as RwLock};
-use std::time::Instant;
+use std::sync::{
+    mpsc::{sync_channel, SyncSender},
+    Arc, SgxMutex as Mutex, SgxRwLock as RwLock,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 use std::untrusted::time::InstantEx;
 use std::vec::Vec;
 
 //The parameter in bucket oblivious sort
 //For an overflow probability of 2^-80 and most reasonable values of n, Z = 512 suffices.
 pub const BIN_SIZE_IN_BLOCK: usize = 512;
-//assume dummy element random_key=0 or u64::MAX
-const DUMMY_KEY_LEFT: u64 = 0;
-const DUMMY_KEY_RIGHT: u64 = u64::MAX;
+const NUM_THREADS: usize = 8;
 lazy_static! {
     // The key used to encrypt the tmp position map. Note that the tmp pos map is transfer across
     // levels of ORAM, so the key cannot use the aes_key or hash_key of each ORAM.
@@ -34,8 +38,8 @@ lazy_static! {
     // cache bin inside enclave
     pub static ref DATA_BIN_BUF: Arc<RwLock<Vec<Arc<Mutex<Vec<u8>>>>>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref META_BIN_BUF: Arc<RwLock<Vec<Arc<Mutex<Vec<u8>>>>>> = Arc::new(RwLock::new(Vec::new()));
-    pub static ref SRC_BINS: Arc<RwLock<Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>)>>>>> = Arc::new(RwLock::new(Vec::new()));
-    pub static ref DST_BINS: Arc<RwLock<Vec<Arc<Mutex<(Vec<u8>, Vec<u8>, Vec<u8>)>>>>> = Arc::new(RwLock::new(Vec::new()));
+    pub static ref SRC_BINS: Arc<RwLock<Vec<Arc<Mutex<(Vec<u8>, Vec<u8>)>>>>> = Arc::new(RwLock::new(Vec::new()));
+    pub static ref DST_BINS: Arc<RwLock<Vec<Arc<Mutex<(Vec<u8>, Vec<u8>)>>>>> = Arc::new(RwLock::new(Vec::new()));
 }
 
 //return the hash of current node and the extrameta which keeps hashes of children
@@ -183,7 +187,6 @@ fn encrypt_and_authenticate_bin<Rng, DataSize, MetaSize>(
     hash_key: &GenericArray<u8, KeySize>,
     data: &mut [A64Bytes<DataSize>],
     meta: &mut [A8Bytes<MetaSize>],
-    random_keys: &mut [u64],
     cur_bin_num: usize,
     freshness_nonce: &GenericArray<u8, NonceSize>,
     rng: &mut Rng,
@@ -210,12 +213,6 @@ where
         cipher.apply_keystream(item);
         hasher.update(item.as_ref().deref());
     }
-    for item in random_keys {
-        let mut item_buf = item.to_ne_bytes();
-        cipher.apply_keystream(&mut item_buf);
-        hasher.update(item_buf);
-        *item = u64::from_ne_bytes(item_buf);
-    }
     let result = hasher.finalize();
     (nonce, result[..16].try_into().unwrap())
 }
@@ -227,7 +224,6 @@ fn decrypt_and_verify_bin<DataSize, MetaSize>(
     hash_key: &GenericArray<u8, KeySize>,
     data: &mut [A64Bytes<DataSize>],
     meta: &mut [A8Bytes<MetaSize>],
-    random_keys: &mut [u64],
     cur_bin_num: usize,
     freshness_nonce: &GenericArray<u8, NonceSize>,
     nonce: &GenericArray<u8, NonceSize>,
@@ -251,12 +247,6 @@ fn decrypt_and_verify_bin<DataSize, MetaSize>(
         hasher.update(item.as_ref().deref());
         cipher.apply_keystream(item);
     }
-    for item in random_keys {
-        let mut item_buf = item.to_ne_bytes();
-        hasher.update(item_buf);
-        cipher.apply_keystream(&mut item_buf);
-        *item = u64::from_ne_bytes(item_buf);
-    }
     let loaded_hash: Hash = hasher.finalize()[..16].try_into().unwrap();
     assert_eq!(&loaded_hash, hash);
 }
@@ -267,11 +257,11 @@ fn push_bin<Rng, DataSize, MetaSize>(
     hash_key: &GenericArray<u8, KeySize>,
     freshness_nonce: &GenericArray<u8, NonceSize>,
     shuffle_id: u64,
+    tid: usize,
     cur_bin_num: usize,
     bin_type: u8,
     data: &mut [A64Bytes<DataSize>],
     meta: &mut [A8Bytes<MetaSize>],
-    random_keys: &mut [u64],
     num_bins: usize,
     rng: &mut Rng,
 ) where
@@ -286,9 +276,6 @@ fn push_bin<Rng, DataSize, MetaSize>(
         };
         let meta_slice = unsafe {
             core::slice::from_raw_parts(meta.as_ptr() as *const u8, meta.len() * MetaSize::USIZE)
-        };
-        let random_key_slice = unsafe {
-            core::slice::from_raw_parts(random_keys.as_ptr() as *const u8, random_keys.len() * 8)
         };
         if bin_type == 0 {
             if !data.is_empty() {
@@ -320,10 +307,6 @@ fn push_bin<Rng, DataSize, MetaSize>(
                 dst_bin.1 = Vec::new();
                 dst_bin.1.extend_from_slice(meta_slice);
             }
-            if !random_keys.is_empty() {
-                dst_bin.2 = Vec::new();
-                dst_bin.2.extend_from_slice(random_key_slice);
-            }
         }
     } else {
         let (nonce, hash) = encrypt_and_authenticate_bin(
@@ -331,7 +314,6 @@ fn push_bin<Rng, DataSize, MetaSize>(
             hash_key,
             data,
             meta,
-            random_keys,
             cur_bin_num,
             &freshness_nonce,
             rng,
@@ -339,11 +321,11 @@ fn push_bin<Rng, DataSize, MetaSize>(
 
         helpers::shuffle_push_bin_ocall(
             shuffle_id,
+            tid,
             cur_bin_num,
             bin_type,
             data,
             meta,
-            random_keys,
             &nonce,
             &hash,
         );
@@ -357,13 +339,13 @@ fn pull_bin<DataSize, MetaSize>(
     hash_key: &GenericArray<u8, KeySize>,
     freshness_nonce: &GenericArray<u8, NonceSize>,
     shuffle_id: u64,
+    tid: usize,
     cur_bin_num: usize,
     num_bins: usize,
     bin_type: u8,
     bin_size: &mut usize,
     data: &mut [A64Bytes<DataSize>],
     meta: &mut [A8Bytes<MetaSize>],
-    random_keys: &mut [u64],
 ) where
     DataSize: ArrayLength<u8> + PartialDiv<U8>,
     MetaSize: ArrayLength<u8> + PartialDiv<U8>,
@@ -380,12 +362,6 @@ fn pull_bin<DataSize, MetaSize>(
             core::slice::from_raw_parts_mut(
                 meta.as_mut_ptr() as *mut u8,
                 meta.len() * MetaSize::USIZE,
-            )
-        };
-        let random_key_slice = unsafe {
-            core::slice::from_raw_parts_mut(
-                random_keys.as_mut_ptr() as *mut u8,
-                random_keys.len() * 8,
             )
         };
         if bin_type == 0 {
@@ -416,33 +392,28 @@ fn pull_bin<DataSize, MetaSize>(
             assert!(!meta_slice.is_empty());
             meta_slice[0..src_bin.1.len()].copy_from_slice(&*src_bin.1);
             *bin_size = src_bin.1.len() / MetaSize::USIZE;
-            if !random_keys.is_empty() {
-                random_key_slice[0..src_bin.2.len()].copy_from_slice(&*src_bin.2);
-            }
         }
     } else {
         let mut nonce = GenericArray::<u8, NonceSize>::default();
         let mut hash = Default::default();
         helpers::shuffle_pull_bin_ocall(
             shuffle_id,
+            tid,
             cur_bin_num,
             bin_type,
             bin_size,
             data,
             meta,
-            random_keys,
             &mut nonce,
             &mut hash,
         );
         let has_data = (data.len() > 0) as usize;
         let has_meta = (meta.len() > 0) as usize;
-        let has_random_keys = (random_keys.len() > 0) as usize;
         decrypt_and_verify_bin(
             aes_key,
             hash_key,
             &mut data[..*bin_size * has_data],
             &mut meta[..*bin_size * has_meta],
-            &mut random_keys[..*bin_size * has_random_keys],
             cur_bin_num,
             &freshness_nonce,
             &nonce,
@@ -489,10 +460,10 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
         .unwrap()
         .resize_with(num_bins_encl, || Arc::new(Mutex::new(Vec::new())));
     SRC_BINS.write().unwrap().resize_with(num_bins_encl, || {
-        Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new())))
+        Arc::new(Mutex::new((Vec::new(), Vec::new())))
     });
     DST_BINS.write().unwrap().resize_with(num_bins_encl, || {
-        Arc::new(Mutex::new((Vec::new(), Vec::new(), Vec::new())))
+        Arc::new(Mutex::new((Vec::new(), Vec::new())))
     });
 
     let mut prev_tier_hash: Hash = Default::default();
@@ -584,10 +555,10 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                 hash_key,
                 seal_nonce,
                 shuffle_id,
+                0,
                 cur_bin_num,
                 0,
                 &mut data,
-                &mut Vec::new(),
                 &mut Vec::new(),
                 num_bins,
                 rng,
@@ -597,11 +568,11 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                 hash_key,
                 seal_nonce,
                 shuffle_id,
+                0,
                 cur_bin_num,
                 0,
                 &mut Vec::new(),
                 &mut original_meta,
-                &mut Vec::new(),
                 num_bins,
                 rng,
             );
@@ -613,11 +584,11 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                 hash_key,
                 freshness_nonce,
                 shuffle_id,
+                0,
                 cur_bin_num,
                 1,
                 &mut Vec::new(),
                 &mut meta,
-                &mut Vec::new(),
                 num_bins,
                 rng,
             );
@@ -696,10 +667,10 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                     hash_key,
                     seal_nonce,
                     shuffle_id,
+                    0,
                     cur_bin_num,
                     0,
                     &mut data,
-                    &mut Vec::new(),
                     &mut Vec::new(),
                     num_bins,
                     rng,
@@ -709,11 +680,11 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                     hash_key,
                     seal_nonce,
                     shuffle_id,
+                    0,
                     cur_bin_num,
                     0,
                     &mut Vec::new(),
                     &mut original_meta,
-                    &mut Vec::new(),
                     num_bins,
                     rng,
                 );
@@ -727,11 +698,11 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                     hash_key,
                     freshness_nonce,
                     shuffle_id,
+                    0,
                     cur_bin_num,
                     1,
                     &mut Vec::new(),
                     &mut meta,
-                    &mut Vec::new(),
                     num_bins,
                     rng,
                 );
@@ -749,7 +720,7 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
         }
     }
 
-    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
+    helpers::bin_switch_ocall(shuffle_id);
 
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("finish pull all oram buckets, {:?}s", dur);
@@ -802,6 +773,13 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         num_bins & (num_bins - 1) == 0,
         "num_bins must be a power of two"
     );
+    helpers::set_fixed_bin_size_ocall(
+        shuffle_id,
+        DataSize::U64,
+        MetaSize::U64,
+        bin_size_in_bucket as u64,
+    );
+
     //reorganize buckets and prepare bins for subsequent shuffle
     //only if level = 0, it is possible that the inputs are buckets
     //Currently we only implement case 2, the inputs are definitely buckets for level = 0
@@ -824,13 +802,12 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
 
         let now = Instant::now();
         //sort by logical address, i.e., block num
-        bucket_oblivious_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>, Z>(
+        bin_bitonic_sort::<_, Quot<DataSize, Z>, Quot<MetaSize, Z>>(
             aes_key,
             hash_key,
             &freshness_nonce,
             shuffle_id,
             num_bins,
-            0,
             1,
             false,
             rng,
@@ -921,13 +898,13 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 hash_key,
                 seal_nonce,
                 shuffle_id,
+                0,
                 cur_bin_num,
                 num_bins,
                 1,
                 &mut actual_bin_size,
                 &mut data,
                 &mut src_meta,
-                &mut Vec::new(),
             );
             assert_eq!(actual_bin_size, src_meta.len());
             let mut dst_meta: Vec<A8Bytes<DstMetaSize>> =
@@ -970,13 +947,13 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 hash_key,
                 seal_nonce,
                 shuffle_id,
+                0,
                 cur_bin_num,
                 num_bins,
                 1,
                 &mut actual_bin_size,
                 &mut data,
                 &mut meta,
-                &mut Vec::new(),
             );
             assert_eq!(actual_bin_size, meta.len());
             //clear the new idx
@@ -1128,6 +1105,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 //save the oram buckets
                 helpers::shuffle_push_buckets_ocall(
                     shuffle_id,
+                    0,
                     b_idx,
                     e_idx,
                     &data,
@@ -1245,6 +1223,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     //save the oram buckets
                     helpers::shuffle_push_buckets_ocall(
                         shuffle_id,
+                        0,
                         b_idx,
                         e_idx,
                         &data,
@@ -1284,24 +1263,81 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     println!("finish build oram from shuffle manager");
 }
 
-fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
+fn bin_bitonic_sort<Rng, DataSize, MetaSize>(
     aes_key: &GenericArray<u8, KeySize>,
     hash_key: &GenericArray<u8, KeySize>,
     freshness_nonce: &GenericArray<u8, NonceSize>,
     shuffle_id: u64,
     num_bins: usize,
-    first_real_bin: usize,
     key_by: usize,
     has_data: bool,
     rng: &mut Rng,
 ) where
     DataSize: ArrayLength<u8> + PartialDiv<U8>,
     MetaSize: ArrayLength<u8> + PartialDiv<U8>,
-    Z: Unsigned,
     Rng: RngCore + CryptoRng,
 {
+    fn oswap_in_vec<DataSize, MetaSize>(
+        condition: Choice,
+        data: &mut Vec<A64Bytes<DataSize>>,
+        meta: &mut Vec<A8Bytes<MetaSize>>,
+        x: usize,
+        y: usize,
+    ) where
+        DataSize: ArrayLength<u8> + PartialDiv<U8>,
+        MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+    {
+        if !data.is_empty() {
+            let t = data.split_at_mut(x + 1);
+            cswap(condition, &mut t.0[x], &mut t.1[y - x - 1]);
+        }
+        let t = meta.split_at_mut(x + 1);
+        cswap(condition, &mut t.0[x], &mut t.1[y - x - 1]);
+    }
+
+    fn process_inside_bin<DataSize, MetaSize>(
+        bin_size: usize,
+        key_by: usize,
+        data: &mut Vec<A64Bytes<DataSize>>,
+        meta: &mut Vec<A8Bytes<MetaSize>>,
+        i: usize,
+        l: usize,
+        mut jj: usize,
+        kk: usize,
+    ) where
+        DataSize: ArrayLength<u8> + PartialDiv<U8>,
+        MetaSize: ArrayLength<u8> + PartialDiv<U8>,
+    {
+        assert!(l - i >= bin_size);
+        while jj > 0 {
+            for ii in i..i + bin_size {
+                let ll = ii ^ jj;
+                if ii < ll {
+                    assert!(ll >= i && ll < i + bin_size);
+                    let x = ii - i;
+                    let y = ll - i;
+                    let condition = !((ii & kk).ct_eq(&0)
+                        ^ (get_key(&meta[x], key_by)).ct_gt(&get_key(&meta[y], key_by)));
+                    oswap_in_vec(condition, data, meta, x, y);
+                }
+            }
+            for ii in l..l + bin_size {
+                let ll = ii ^ jj;
+                if ii < ll {
+                    assert!(ll >= l && ll < l + bin_size);
+                    let x = ii - l + bin_size;
+                    let y = ll - l + bin_size;
+                    let condition = !((ii & kk).ct_eq(&0)
+                        ^ (get_key(&meta[x], key_by)).ct_gt(&get_key(&meta[y], key_by)));
+                    oswap_in_vec(condition, data, meta, x, y);
+                }
+            }
+            jj >>= 1;
+        }
+    }
+
+    let bin_size = BIN_SIZE_IN_BLOCK / 2;
     if num_bins == 1 {
-        let bin_size = BIN_SIZE_IN_BLOCK / 2;
         let mut meta = vec![Default::default(); bin_size];
         let mut data = vec![Default::default(); bin_size * has_data as usize];
         if has_data {
@@ -1310,12 +1346,12 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
                 hash_key,
                 freshness_nonce,
                 shuffle_id,
-                first_real_bin,
+                0,
+                0,
                 num_bins,
                 0,
                 &mut 0,
                 &mut data,
-                &mut Vec::new(),
                 &mut Vec::new(),
             );
             pull_bin::<DataSize, MetaSize>(
@@ -1323,13 +1359,13 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
                 hash_key,
                 freshness_nonce,
                 shuffle_id,
-                first_real_bin,
+                0,
+                0,
                 num_bins,
                 0,
                 &mut 0,
                 &mut Vec::new(),
                 &mut meta,
-                &mut Vec::new(),
             );
         } else {
             pull_bin::<DataSize, MetaSize>(
@@ -1337,655 +1373,206 @@ fn bucket_oblivious_sort<Rng, DataSize, MetaSize, Z>(
                 hash_key,
                 freshness_nonce,
                 shuffle_id,
-                first_real_bin,
+                0,
+                0,
                 num_bins,
                 1,
                 &mut 0,
                 &mut Vec::new(),
                 &mut meta,
-                &mut Vec::new(),
             );
         }
-        bitonic_sort(&mut data, &mut meta, &mut Vec::new(), key_by, true);
+        let n = meta.len();
+        assert!(n != 0);
+        let mut k = 2;
+        while k <= n {
+            let mut j = k >> 1;
+            while j > 0 {
+                for i in 0..n {
+                    let l = i ^ j;
+                    if i < l {
+                        let condition = !((i & k).ct_eq(&0)
+                            ^ (get_key(&meta[i], key_by)).ct_gt(&get_key(&meta[l], key_by)));
+                        oswap_in_vec(condition, &mut data, &mut meta, i, l);
+                    }
+                }
+                j >>= 1;
+            }
+            k <<= 1;
+        }
         push_bin::<_, DataSize, MetaSize>(
             aes_key,
             hash_key,
             &freshness_nonce,
             shuffle_id,
-            first_real_bin,
+            0,
+            0,
             1,
             &mut data,
             &mut meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
-        helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
+        helpers::bin_switch_ocall(shuffle_id);
     } else {
-        //oblivious random bin assignment
-        oblivious_random_bin_assignment::<_, DataSize, MetaSize>(
-            aes_key,
-            hash_key,
-            &freshness_nonce,
-            shuffle_id,
-            num_bins,
-            first_real_bin,
-            has_data,
-            rng,
-        );
-        //oblivious random permutation
-        //note that the bins read may not be equal size
-        //so in this step, we adjust the bins to the same size
-        oblivious_random_permutation::<_, DataSize, MetaSize>(
-            aes_key,
-            hash_key,
-            &freshness_nonce,
-            shuffle_id,
-            num_bins,
-            first_real_bin,
-            has_data,
-            rng,
-        );
-        //merge sort by new idx, which is more suitable for enclave setting
-        non_oblivious_merge_sort::<_, DataSize, MetaSize>(
-            aes_key,
-            hash_key,
-            &freshness_nonce,
-            shuffle_id,
-            num_bins,
-            first_real_bin,
-            key_by,
-            has_data,
-            rng,
-        );
-    }
-}
-
-fn oblivious_random_bin_assignment<Rng, DataSize, MetaSize>(
-    aes_key: &GenericArray<u8, KeySize>,
-    hash_key: &GenericArray<u8, KeySize>,
-    freshness_nonce: &GenericArray<u8, NonceSize>,
-    shuffle_id: u64,
-    num_bins: usize,
-    first_real_bin: usize,
-    has_data: bool,
-    rng: &mut Rng,
-) where
-    DataSize: ArrayLength<u8> + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
-    Rng: RngCore + CryptoRng,
-{
-    let log_b = (num_bins as f64).log2() as usize;
-    let n = num_bins * BIN_SIZE_IN_BLOCK / 2;
-    let mut pow_i = 1;
-    for i in 0..log_b {
-        //TODO: for each i, the freshness_nonce should change
-        let msb_mask = (n >> (i + 1)) as u64;
-        for j in 0..num_bins / 2 {
-            let j_prime = (j >> i) << i;
-            //operate at block level, not bucket level
-            let bin_size = BIN_SIZE_IN_BLOCK;
-            //allocate space for two bins
-            let mut data = vec![Default::default(); 2 * bin_size * (has_data as usize)];
-            let mut meta = vec![Default::default(); 2 * bin_size];
-            let mut random_keys = vec![Default::default(); 2 * bin_size];
-
-            for c in [0, 1] {
-                if i == 0 && has_data {
-                    //note that data and meta are seperately encrypted and authenticated
-                    //moreover, bucket oblivious sort is called only once to sort data and meta together
-                    //and bin_type = 0, for that separate data and meta are fetched from idle bins
-                    pull_bin::<DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        first_real_bin + j_prime + j + c * pow_i,
-                        num_bins,
-                        0,
-                        &mut 0,
-                        //for i == 0, dummy elements are padded by ourselves, not by loading
-                        &mut data[c * bin_size..(c + 1) * bin_size - bin_size / 2],
-                        &mut Vec::new(),
-                        &mut Vec::new(),
-                    );
-                    pull_bin::<DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        first_real_bin + j_prime + j + c * pow_i,
-                        num_bins,
-                        0,
-                        &mut 0,
-                        &mut Vec::new(),
-                        //for i == 0, dummy elements are padded by ourselves, not by loading
-                        &mut meta[c * bin_size..(c + 1) * bin_size - bin_size / 2],
-                        &mut Vec::new(),
-                    );
-                    //assign random keys
-                    for key in random_keys[c * bin_size..c * bin_size + bin_size / 2].iter_mut() {
-                        *key = (rng.next_u64() & (n as u64 - 1)) + 1;
-                    }
-                    for key in
-                        random_keys[c * bin_size + bin_size / 2..(c + 1) * bin_size].iter_mut()
-                    {
-                        *key = DUMMY_KEY_LEFT;
-                    }
-                } else if i == 0 && !has_data {
-                    pull_bin::<DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        first_real_bin + j_prime + j + c * pow_i,
-                        num_bins,
-                        1,
-                        &mut 0,
-                        &mut Vec::new(),
-                        //for i == 0, dummy elements are padded by ourselves, not by loading
-                        &mut meta[c * bin_size..(c + 1) * bin_size - bin_size / 2],
-                        &mut Vec::new(),
-                    );
-                    //assign random keys
-                    for key in random_keys[c * bin_size..c * bin_size + bin_size / 2].iter_mut() {
-                        *key = (rng.next_u64() & (n as u64 - 1)) + 1;
-                    }
-                    for key in
-                        random_keys[c * bin_size + bin_size / 2..(c + 1) * bin_size].iter_mut()
-                    {
-                        *key = DUMMY_KEY_LEFT;
-                    }
-                } else if i > 0 {
-                    pull_bin::<DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        first_real_bin + j_prime + j + c * pow_i,
-                        num_bins,
-                        1,
-                        &mut 0,
-                        &mut data[c * bin_size * has_data as usize
-                            ..(c + 1) * bin_size * has_data as usize],
-                        &mut meta[c * bin_size..(c + 1) * bin_size],
-                        &mut random_keys[c * bin_size..(c + 1) * bin_size],
-                    );
-                }
-            }
-            merge_split::<DataSize, MetaSize>(&mut data, &mut meta, &mut random_keys, msb_mask);
-            //for the last i, remove dummy elements and do not store random keys
-            if i == log_b - 1 {
-                //this step does not need to be oblivious
-                let mut search_idx_left = bin_size >> 1;
-                let mut search_idx_right = bin_size + (bin_size >> 1);
-                while search_idx_left <= bin_size - 1
-                    && random_keys[search_idx_left] == DUMMY_KEY_LEFT
-                {
-                    search_idx_left += 1;
-                }
-                while search_idx_left != usize::MAX
-                    && random_keys[search_idx_left] != DUMMY_KEY_LEFT
-                {
-                    search_idx_left = search_idx_left.wrapping_sub(1);
-                }
-                search_idx_left = search_idx_left.wrapping_add(1);
-                assert!(search_idx_left < search_idx_right);
-                while search_idx_right <= (bin_size << 1) - 1
-                    && random_keys[search_idx_right] != DUMMY_KEY_RIGHT
-                {
-                    search_idx_right += 1;
-                }
-                if search_idx_right > (bin_size << 1) - 1 {
-                    search_idx_right -= 1;
-                }
-                while search_idx_right != bin_size - 1
-                    && random_keys[search_idx_right] == DUMMY_KEY_RIGHT
-                {
-                    search_idx_right = search_idx_right.wrapping_sub(1);
-                }
-                search_idx_right = search_idx_right.wrapping_add(1);
-                assert!(search_idx_left <= bin_size);
-                assert!(search_idx_right >= bin_size);
-                for c in [0, 1] {
-                    push_bin::<_, DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        first_real_bin + 2 * j + c,
-                        1,
-                        &mut data[(c * bin_size + (1 - c) * search_idx_left) * has_data as usize
-                            ..((1 - c) * bin_size + c * search_idx_right) * has_data as usize],
-                        &mut meta[c * bin_size + (1 - c) * search_idx_left
-                            ..(1 - c) * bin_size + c * search_idx_right],
-                        &mut Vec::new(),
-                        num_bins,
-                        rng,
-                    );
-                }
-                random_keys.clear();
-            } else {
-                for c in [0, 1] {
-                    push_bin::<_, DataSize, MetaSize>(
-                        aes_key,
-                        hash_key,
-                        freshness_nonce,
-                        shuffle_id,
-                        first_real_bin + 2 * j + c,
-                        1,
-                        &mut data[c * bin_size * has_data as usize
-                            ..(c + 1) * bin_size * has_data as usize],
-                        &mut meta[c * bin_size..(c + 1) * bin_size],
-                        &mut random_keys[c * bin_size..(c + 1) * bin_size],
-                        num_bins,
-                        rng,
-                    );
-                }
-            }
-        }
-        helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
-        pow_i <<= 1;
-    }
-}
-
-fn merge_split<DataSize, MetaSize>(
-    data: &mut Vec<A64Bytes<DataSize>>,
-    meta: &mut Vec<A8Bytes<MetaSize>>,
-    random_keys: &mut Vec<u64>,
-    msb_mask: u64,
-) where
-    DataSize: ArrayLength<u8> + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
-{
-    let n = meta.len();
-    let half = n >> 1;
-    let mut real_elem_cnt = (0, 0); //left: msb=0, right: msb=1;
-
-    //The acutal key = key - 1 for non-dummy element
-    for key in random_keys.iter_mut() {
-        real_elem_cnt.0 += (key.saturating_sub(1) & msb_mask == 0 && *key != DUMMY_KEY_LEFT) as u64;
-        real_elem_cnt.1 += (key.saturating_sub(1) & msb_mask > 0 && *key != DUMMY_KEY_RIGHT) as u64;
-    }
-
-    let mut dummy_elem_cnt = (half as u64 - real_elem_cnt.0, half as u64 - real_elem_cnt.1);
-
-    //change the dummy key
-    for key in random_keys.iter_mut() {
-        let is_dummy = *key == DUMMY_KEY_LEFT || *key == DUMMY_KEY_RIGHT;
-        *key -= *key * is_dummy as u64;
-        let dummy_elem_left_cnt = dummy_elem_cnt.0;
-        let res = dummy_elem_left_cnt.checked_sub(1);
-        dummy_elem_cnt.0 -= (res.is_some() && is_dummy) as u64;
-        *key += DUMMY_KEY_RIGHT * (res.is_none() && is_dummy) as u64;
-    }
-
-    bitonic_sort(data, meta, random_keys, 0, true);
-}
-
-fn oblivious_random_permutation<Rng, DataSize, MetaSize>(
-    aes_key: &GenericArray<u8, KeySize>,
-    hash_key: &GenericArray<u8, KeySize>,
-    freshness_nonce: &GenericArray<u8, NonceSize>,
-    shuffle_id: u64,
-    num_bins: usize,
-    first_real_bin: usize,
-    has_data: bool,
-    rng: &mut Rng,
-) where
-    DataSize: ArrayLength<u8> + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
-    Rng: RngCore + CryptoRng,
-{
-    let mut acc_data = vec![];
-    let mut acc_meta = vec![];
-    let mut cur_bin_num_new = 0;
-    //since we remove dummy element in bin (not dummy blocks in oram), the size may not be equal
-    //to BIN_SIZE_IN_BLOCK/2, but it is expected not exceeding BIN_SIZE_IN_BLOCK
-    let expected_bin_size = BIN_SIZE_IN_BLOCK / 2;
-    for cur_bin_num in 0..num_bins {
-        let mut actual_bin_size = 0;
-        let mut data = vec![Default::default(); 2 * expected_bin_size * (has_data as usize)];
-        let mut meta = vec![Default::default(); 2 * expected_bin_size];
-        pull_bin::<DataSize, MetaSize>(
-            aes_key,
-            hash_key,
-            freshness_nonce,
-            shuffle_id,
-            first_real_bin + cur_bin_num,
-            num_bins,
-            1,
-            &mut actual_bin_size,
-            &mut data,
-            &mut meta,
-            &mut Vec::new(),
-        );
-        data.truncate(actual_bin_size);
-        meta.truncate(actual_bin_size);
-        //necessary? how does it influence performance?
-        data.shrink_to_fit();
-        meta.shrink_to_fit();
-
-        if meta.len() >= expected_bin_size {
-            let mut remaining_meta = meta.split_off(expected_bin_size);
-            acc_meta.append(&mut remaining_meta);
-            if has_data {
-                let mut remaining_data = data.split_off(expected_bin_size);
-                acc_data.append(&mut remaining_data);
-            }
-            let mut random_keys = (0..expected_bin_size)
-                .map(|_| rng.next_u64())
-                .collect::<Vec<_>>();
-            bitonic_sort(&mut data, &mut meta, &mut random_keys, 0, true);
-            push_bin::<_, DataSize, MetaSize>(
-                aes_key,
-                hash_key,
-                freshness_nonce,
-                shuffle_id,
-                first_real_bin + cur_bin_num_new,
-                1,
-                &mut data,
-                &mut meta,
-                &mut Vec::new(),
-                num_bins,
-                rng,
-            );
-            cur_bin_num_new += 1;
-        } else {
-            acc_meta.append(&mut meta);
-            //even if data is empty, the following statement is valid
-            acc_data.append(&mut data);
-        }
-
-        while acc_meta.len() >= expected_bin_size {
-            let meta = acc_meta.split_off(expected_bin_size);
-            let data = if has_data {
-                acc_data.split_off(expected_bin_size)
-            } else {
-                Vec::new()
-            };
-            push_bin::<_, DataSize, MetaSize>(
-                aes_key,
-                hash_key,
-                freshness_nonce,
-                shuffle_id,
-                first_real_bin + cur_bin_num_new,
-                1,
-                &mut acc_data,
-                &mut acc_meta,
-                &mut Vec::new(),
-                num_bins,
-                rng,
-            );
-            acc_meta = meta;
-            //even if data is empty, the following statement is valid
-            acc_data = data;
-            cur_bin_num_new += 1;
-        }
-    }
-    helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
-    assert_eq!(acc_meta.len(), 0);
-    assert_eq!(cur_bin_num_new, num_bins);
-}
-
-//either sort by random keys or something in meta indexed by key_by
-fn bitonic_sort<DataSize, MetaSize>(
-    data: &mut [A64Bytes<DataSize>],
-    meta: &mut [A8Bytes<MetaSize>],
-    random_keys: &mut [u64],
-    key_by: usize,
-    is_oblivious: bool,
-) where
-    DataSize: ArrayLength<u8> + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
-{
-    let n = meta.len();
-    assert!(n != 0);
-    let mut k = 2;
-    while k <= n {
-        let mut j = k >> 1;
-        while j > 0 {
-            for i in 0..n {
-                let l = i ^ j;
-                if i < l {
-                    let condition = if random_keys.is_empty() {
-                        !((i & k).ct_eq(&0)
-                            ^ (get_key(&meta[i], key_by)).ct_gt(&get_key(&meta[l], key_by)))
-                    } else {
-                        !((i & k).ct_eq(&0) ^ (random_keys[i]).ct_gt(&random_keys[l]))
-                    };
-                    if is_oblivious {
-                        if !random_keys.is_empty() {
-                            let t = random_keys.split_at_mut(i + 1);
-                            cswap(condition, &mut t.0[i], &mut t.1[l - i - 1]);
-                        }
-                        if !data.is_empty() {
-                            let t = data.split_at_mut(i + 1);
-                            cswap(condition, &mut t.0[i], &mut t.1[l - i - 1]);
-                        }
-                        let t = meta.split_at_mut(i + 1);
-                        cswap(condition, &mut t.0[i], &mut t.1[l - i - 1]);
-                    } else {
-                        if condition.unwrap_u8() != 0 {
-                            if !random_keys.is_empty() {
-                                random_keys.swap(i, l);
+        let mut handlers = Vec::new();
+        let idle_threads = Arc::new(Mutex::new((0..NUM_THREADS).collect::<VecDeque<_>>()));
+        let mut handlers_map = HashMap::new();
+        for tid in 0..NUM_THREADS {
+            let aes_key = aes_key.clone();
+            let hash_key = hash_key.clone();
+            let freshness_nonce = freshness_nonce.clone();
+            let idle_threads = idle_threads.clone();
+            let (tx, rx) = sync_channel::<(usize, usize, usize)>(0);
+            handlers_map.insert(tid, tx);
+            let mut rng = rng_maker(get_seeded_rng())();
+            let builder = thread::Builder::new();
+            let handler = builder
+                .spawn(move || {
+                    for (i, j, k) in rx {
+                        let bin_size = BIN_SIZE_IN_BLOCK / 2;
+                        let l = i ^ j;
+                        //allocate space for two bins
+                        let mut data = vec![Default::default(); 2 * bin_size * (has_data as usize)];
+                        let mut meta = vec![Default::default(); 2 * bin_size];
+                        let is_first_load = k == 2 * bin_size && j == k >> 1;
+                        for c in IntoIterator::into_iter([i / bin_size, l / bin_size]).enumerate() {
+                            if is_first_load && has_data {
+                                //note that data and meta are seperately encrypted and authenticated
+                                //moreover, bucket oblivious sort is called only once to sort data and meta together
+                                //and bin_type = 0, for that separate data and meta are fetched from idle bins
+                                pull_bin::<DataSize, MetaSize>(
+                                    &aes_key,
+                                    &hash_key,
+                                    &freshness_nonce,
+                                    shuffle_id,
+                                    tid,
+                                    c.1,
+                                    num_bins,
+                                    0,
+                                    &mut 0,
+                                    &mut data[c.0 * bin_size..(c.0 + 1) * bin_size],
+                                    &mut Vec::new(),
+                                );
+                                pull_bin::<DataSize, MetaSize>(
+                                    &aes_key,
+                                    &hash_key,
+                                    &freshness_nonce,
+                                    shuffle_id,
+                                    tid,
+                                    c.1,
+                                    num_bins,
+                                    0,
+                                    &mut 0,
+                                    &mut Vec::new(),
+                                    &mut meta[c.0 * bin_size..(c.0 + 1) * bin_size],
+                                );
+                            } else {
+                                pull_bin::<DataSize, MetaSize>(
+                                    &aes_key,
+                                    &hash_key,
+                                    &freshness_nonce,
+                                    shuffle_id,
+                                    tid,
+                                    c.1,
+                                    num_bins,
+                                    1,
+                                    &mut 0,
+                                    &mut data[c.0 * bin_size * has_data as usize
+                                        ..(c.0 + 1) * bin_size * has_data as usize],
+                                    &mut meta[c.0 * bin_size..(c.0 + 1) * bin_size],
+                                );
                             }
-                            if !data.is_empty() {
-                                data.swap(i, l);
-                            }
-                            meta.swap(i, l);
                         }
+                        if is_first_load {
+                            //avoid repetitive bin load and bin store
+                            let mut kk = 2;
+                            while kk <= bin_size {
+                                let jj = kk >> 1;
+                                process_inside_bin(
+                                    bin_size, key_by, &mut data, &mut meta, i, l, jj, kk,
+                                );
+                                kk <<= 1;
+                            }
+                        }
+                        for i_bin in i..i + bin_size {
+                            let l_bin = i_bin ^ j;
+                            assert!(l_bin >= l && l_bin < l + bin_size);
+                            let condition = !((i_bin & k).ct_eq(&0)
+                                ^ (get_key(&meta[i_bin - i], key_by))
+                                    .ct_gt(&get_key(&meta[l_bin - l + bin_size], key_by)));
+                            oswap_in_vec(
+                                condition,
+                                &mut data,
+                                &mut meta,
+                                i_bin - i,
+                                l_bin - l + bin_size,
+                            );
+                        }
+                        //finish the iteration j from bin_size/2 to 0
+                        if j == bin_size {
+                            let jj = j >> 1;
+                            process_inside_bin(bin_size, key_by, &mut data, &mut meta, i, l, jj, k);
+                        }
+                        for c in IntoIterator::into_iter([i / bin_size, l / bin_size]).enumerate() {
+                            push_bin::<_, DataSize, MetaSize>(
+                                &aes_key,
+                                &hash_key,
+                                &freshness_nonce,
+                                shuffle_id,
+                                tid,
+                                c.1,
+                                1,
+                                &mut data[c.0 * bin_size * has_data as usize
+                                    ..(c.0 + 1) * bin_size * has_data as usize],
+                                &mut meta[c.0 * bin_size..(c.0 + 1) * bin_size],
+                                num_bins,
+                                &mut rng,
+                            );
+                        }
+                        idle_threads.lock().unwrap().push_back(tid);
                     }
+                })
+                .unwrap();
+            handlers.push(handler);
+        }
+
+        let n = num_bins * bin_size;
+        let mut k = 2 * bin_size;
+        while k <= n {
+            let mut j = k >> 1;
+            while j >= bin_size {
+                let mut i = 0;
+                while i < n {
+                    let l = i ^ j;
+                    if i < l {
+                        let mut tid = idle_threads.lock().unwrap().pop_front();
+                        while tid.is_none() {
+                            thread::sleep(Duration::from_micros(100));
+                            tid = idle_threads.lock().unwrap().pop_front();
+                        }
+                        handlers_map
+                            .get(&tid.unwrap())
+                            .unwrap()
+                            .send((i, j, k))
+                            .unwrap();
+                    }
+                    i += bin_size;
                 }
+                while idle_threads.lock().unwrap().len() < NUM_THREADS {
+                    thread::sleep(Duration::from_micros(1000));
+                }
+                helpers::bin_switch_ocall(shuffle_id);
+                j >>= 1;
             }
-            j >>= 1;
+            k <<= 1;
         }
-        k <<= 1;
-    }
-}
 
-//the additional function is enabled for transformation from new_bucket_idx to new_block_idx
-fn non_oblivious_merge_sort<Rng, DataSize, MetaSize>(
-    aes_key: &GenericArray<u8, KeySize>,
-    hash_key: &GenericArray<u8, KeySize>,
-    freshness_nonce: &GenericArray<u8, NonceSize>,
-    shuffle_id: u64,
-    num_bins: usize,
-    first_real_bin: usize,
-    key_by: usize,
-    has_data: bool,
-    rng: &mut Rng,
-) where
-    DataSize: ArrayLength<u8> + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
-    Rng: RngCore + CryptoRng,
-{
-    let bin_size = BIN_SIZE_IN_BLOCK >> 1; //no dummy elements are contained in bin
-    let mut width = bin_size;
-    let n = num_bins * bin_size;
-    assert!(num_bins >= 2);
-    while width < n {
-        //only the last round enable the additional function
-        //and no update for 0..n/2 block meta, for they are related to dummy block
-        //TODO: may be the idx transformation from bucket index to block index
-        //can be integrited with merge sort.
-
-        // let additional_func = additional_func && width == n >> 1 && first_real_bin != 0;
-        // let total_num_bins = first_real_bin << 1;
-        // let mut cur_num_bins = first_real_bin;
-        // let mut idx_update_end_bin = total_num_bins;
-        // while cur_num_bins > num_bins {
-        //     cur_num_bins >>= 1;
-        //     idx_update_end_bin -= cur_num_bins;
-        // }
-        // let idx_update_begin_bin = idx_update_end_bin - (cur_num_bins >> 1);
-
-        let mut i = 0;
-        let mut cur_bin_num_new = 0;
-        while i < n {
-            bottom_up_merge::<_, DataSize, MetaSize>(
-                aes_key,
-                hash_key,
-                freshness_nonce,
-                shuffle_id,
-                first_real_bin,
-                num_bins,
-                &mut cur_bin_num_new,
-                key_by,
-                i,
-                std::cmp::min(i + width, n),
-                std::cmp::min(i + 2 * width, n),
-                bin_size,
-                has_data,
-                rng,
-            );
-            i += 2 * width;
-        }
-        assert_eq!(cur_bin_num_new, num_bins);
-        width <<= 1;
-        helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
-    }
-}
-
-fn bottom_up_merge<Rng, DataSize, MetaSize>(
-    aes_key: &GenericArray<u8, KeySize>,
-    hash_key: &GenericArray<u8, KeySize>,
-    freshness_nonce: &GenericArray<u8, NonceSize>,
-    shuffle_id: u64,
-    first_real_bin: usize,
-    num_bins: usize,
-    cur_bin_num_new: &mut usize,
-    key_by: usize,
-    i_left: usize,
-    i_right: usize,
-    i_end: usize,
-    bin_size: usize,
-    has_data: bool,
-    rng: &mut Rng,
-) where
-    Rng: RngCore + CryptoRng,
-    DataSize: ArrayLength<u8> + PartialDiv<U8>,
-    MetaSize: ArrayLength<u8> + PartialDiv<U8>,
-{
-    //In our case, n is the power of 2.
-    assert_eq!(i_right - i_left, i_end - i_right);
-    let width = i_right - i_left;
-
-    let i_left_bin = i_left / bin_size;
-    let i_right_bin = i_right / bin_size;
-    let i_end_bin = i_end / bin_size;
-    let mut i_bin = i_left_bin;
-    let mut j_bin = i_right_bin;
-
-    let mut i = 0;
-    let mut j = 0;
-
-    let mut meta = vec![Default::default(); 2 * bin_size];
-    let mut data = vec![Default::default(); 2 * bin_size * has_data as usize];
-    for (c, &cur_bin_num) in [i_bin, j_bin].iter().enumerate() {
-        pull_bin::<DataSize, MetaSize>(
-            aes_key,
-            hash_key,
-            &freshness_nonce,
-            shuffle_id,
-            first_real_bin + cur_bin_num,
-            num_bins,
-            1,
-            &mut 0,
-            &mut data[c * bin_size * has_data as usize..(c + 1) * bin_size * has_data as usize],
-            &mut meta[c * bin_size..(c + 1) * bin_size],
-            &mut Vec::new(),
-        );
-        //if it is the first round, sort the bin itself first
-        if width == bin_size {
-            bitonic_sort(
-                &mut data[c * bin_size * has_data as usize..(c + 1) * bin_size * has_data as usize],
-                &mut meta[c * bin_size..(c + 1) * bin_size],
-                &mut Vec::new(),
-                key_by,
-                false,
-            );
+        drop(handlers_map);
+        for handler in handlers {
+            handler.join().unwrap();
         }
     }
-    i_bin += 1;
-    j_bin += 1;
-
-    let mut sorted_data = Vec::with_capacity(bin_size * (has_data as usize));
-    let mut sorted_meta = Vec::with_capacity(bin_size);
-
-    for k in i_left..i_end {
-        //when exhaust one bin, pull
-        if i >= bin_size && i_bin < i_right_bin {
-            i = 0;
-            pull_bin::<DataSize, MetaSize>(
-                aes_key,
-                hash_key,
-                &freshness_nonce,
-                shuffle_id,
-                first_real_bin + i_bin,
-                num_bins,
-                1,
-                &mut 0,
-                &mut data[..bin_size * has_data as usize],
-                &mut meta[..bin_size],
-                &mut Vec::new(),
-            );
-            i_bin += 1;
-        }
-        if j >= bin_size && j_bin < i_end_bin {
-            j = 0;
-            pull_bin::<DataSize, MetaSize>(
-                aes_key,
-                hash_key,
-                &freshness_nonce,
-                shuffle_id,
-                first_real_bin + j_bin,
-                num_bins,
-                1,
-                &mut 0,
-                &mut data[bin_size * has_data as usize..2 * bin_size * has_data as usize],
-                &mut meta[bin_size..2 * bin_size],
-                &mut Vec::new(),
-            );
-            j_bin += 1;
-        }
-        if i < bin_size
-            && (j >= bin_size || get_key(&meta[i], key_by) < get_key(&meta[bin_size + j], key_by))
-        {
-            sorted_meta.push(meta[i].clone());
-            if has_data {
-                sorted_data.push(data[i].clone());
-            }
-            i += 1;
-        } else {
-            sorted_meta.push(meta[bin_size + j].clone());
-            if has_data {
-                sorted_data.push(data[bin_size + j].clone());
-            }
-            j += 1;
-        }
-        //when form a new bin, push
-        if (k + 1) % bin_size == 0 {
-            push_bin::<_, DataSize, MetaSize>(
-                aes_key,
-                hash_key,
-                &freshness_nonce,
-                shuffle_id,
-                first_real_bin + *cur_bin_num_new,
-                1,
-                &mut sorted_data,
-                &mut sorted_meta,
-                &mut Vec::new(),
-                num_bins,
-                rng,
-            );
-            sorted_data.clear();
-            sorted_meta.clear();
-            *cur_bin_num_new += 1;
-        }
-    }
-    assert!(sorted_data.is_empty());
-    assert!(sorted_meta.is_empty());
 }
 
 fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
@@ -2066,13 +1653,13 @@ fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &freshness_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
         );
 
         //build data for next level ORAM
@@ -2105,11 +1692,11 @@ fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &freshness_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             1,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
@@ -2133,7 +1720,7 @@ fn oblivious_push_tmp_posmap<Rng, DataSize, MetaSize, Z>(
     nonce_buf.clone_from_slice(&nonce);
     hash_buf.clone_from_slice(&hash);
 
-    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
+    helpers::bin_switch_ocall(shuffle_id);
 }
 
 fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
@@ -2212,10 +1799,10 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &seal_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             0,
             &mut data,
-            &mut Vec::new(),
             &mut Vec::new(),
             num_bins,
             rng,
@@ -2225,11 +1812,11 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &seal_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             0,
             &mut Vec::new(),
             &mut original_meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
@@ -2239,11 +1826,11 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &freshness_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             1,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
@@ -2255,7 +1842,7 @@ fn oblivious_pull_tmp_posmap<Rng, DataSize, MetaSize, Z>(
     unsafe {
         shuffle_release_tmp_posmap();
     }
-    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
+    helpers::bin_switch_ocall(shuffle_id);
 }
 
 pub fn oblivious_pull_trivial_posmap(data: &mut Vec<u32>) {
@@ -2317,7 +1904,6 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
     shuffle_id: u64,
     height: u32,
     num_bins: usize,
-    first_real_bin: usize,
     rng: &mut Rng,
 ) where
     DataSize: ArrayLength<u8> + PartialDiv<U8>,
@@ -2336,13 +1922,13 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &freshness_nonce,
             shuffle_id,
-            first_real_bin + cur_bin_num,
+            0,
+            cur_bin_num,
             num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
         );
 
         for meta_item in meta.iter_mut() {
@@ -2386,16 +1972,16 @@ fn oblivious_push_location_upwards<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &freshness_nonce,
             shuffle_id,
-            first_real_bin + cur_bin_num,
+            0,
+            cur_bin_num,
             1,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
     }
-    helpers::bin_switch_ocall(shuffle_id, first_real_bin, first_real_bin + num_bins);
+    helpers::bin_switch_ocall(shuffle_id);
 }
 
 fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
@@ -2423,13 +2009,13 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &freshness_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
         );
         if cur_bin_num >= num_bins / 2 {
             for meta_item in meta.iter_mut() {
@@ -2448,16 +2034,16 @@ fn oblivious_idx_transformation<Rng, DataSize, MetaSize, Z>(
             hash_key,
             &freshness_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             1,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
     }
-    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
+    helpers::bin_switch_ocall(shuffle_id);
 }
 
 fn oblivious_placement<Rng, DataSize, MetaSize>(
@@ -2535,12 +2121,12 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
             freshness_nonce,
             shuffle_id,
             0,
+            0,
             num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
         );
         place_inside_bin(&mut meta, 0, key_by, invalid_addr);
         if is_rehearsal {
@@ -2556,20 +2142,111 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
             freshness_nonce,
             shuffle_id,
             0,
+            0,
             1,
             &mut Vec::new(),
             &mut meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
-        helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
+        helpers::bin_switch_ocall(shuffle_id);
     } else {
-        let mut expected_new_idx = 0;
+        let mut handlers = Vec::new();
+        let idle_threads = Arc::new(Mutex::new((0..NUM_THREADS).collect::<VecDeque<_>>()));
+        let mut handlers_map = HashMap::new();
+        for tid in 0..NUM_THREADS {
+            let aes_key = aes_key.clone();
+            let hash_key = hash_key.clone();
+            let freshness_nonce = freshness_nonce.clone();
+            let idle_threads = idle_threads.clone();
+            let (tx, rx) = sync_channel::<(usize, usize, usize)>(0);
+            handlers_map.insert(tid, tx);
+            let mut rng = rng_maker(get_seeded_rng())();
+            let builder = thread::Builder::new();
+            let handler = builder
+                .spawn(move || {
+                    for (i, k, base) in rx {
+                        let mut meta = vec![Default::default(); 2 * bin_size];
+                        let j = i ^ k;
+                        let sep = (base + k) as u64;
+
+                        let cur_bin_num = [i / bin_size, j / bin_size];
+                        for c in [0, 1] {
+                            pull_bin::<DataSize, MetaSize>(
+                                &aes_key,
+                                &hash_key,
+                                &freshness_nonce,
+                                shuffle_id,
+                                tid,
+                                cur_bin_num[c],
+                                num_bins,
+                                1,
+                                &mut 0,
+                                &mut Vec::new(),
+                                &mut meta[c * bin_size..(c + 1) * bin_size],
+                            );
+                        }
+                        //oblivious placement across bins
+                        let split_meta_mut = meta.split_at_mut(bin_size);
+                        for (item_left, item_right) in
+                            split_meta_mut.0.iter_mut().zip(split_meta_mut.1.iter_mut())
+                        {
+                            core_f(item_left, item_right, sep, 0, key_by, invalid_addr);
+                        }
+
+                        {
+                            //oblivious placement inside bins
+                            if k == bin_size {
+                                place_inside_bin(
+                                    split_meta_mut.0,
+                                    (cur_bin_num[0] * bin_size) as u64,
+                                    key_by,
+                                    invalid_addr,
+                                );
+                                place_inside_bin(
+                                    split_meta_mut.1,
+                                    (cur_bin_num[1] * bin_size) as u64,
+                                    key_by,
+                                    invalid_addr,
+                                );
+                                if is_rehearsal {
+                                    for (i, meta_item) in split_meta_mut
+                                        .0
+                                        .iter_mut()
+                                        .chain(split_meta_mut.1.iter_mut())
+                                        .enumerate()
+                                    {
+                                        meta_item.as_mut_ne_u64_slice()[key_by] =
+                                            (cur_bin_num[0] * bin_size + i) as u64;
+                                    }
+                                }
+                            }
+                        }
+                        for c in [0, 1] {
+                            push_bin::<_, DataSize, MetaSize>(
+                                &aes_key,
+                                &hash_key,
+                                &freshness_nonce,
+                                shuffle_id,
+                                tid,
+                                cur_bin_num[c],
+                                1,
+                                &mut Vec::new(),
+                                &mut meta[c * bin_size..(c + 1) * bin_size],
+                                num_bins,
+                                &mut rng,
+                            );
+                        }
+                        idle_threads.lock().unwrap().push_back(tid);
+                    }
+                })
+                .unwrap();
+            handlers.push(handler);
+        }
+
         let n = num_bins * bin_size;
         let mut k = n >> 1;
         while k >= bin_size {
-            let mut meta = vec![Default::default(); 2 * bin_size];
             let mut base = 0;
             for i in 0..n {
                 //if i % (k*2)
@@ -2578,78 +2255,28 @@ fn oblivious_placement<Rng, DataSize, MetaSize>(
                 }
                 let j = i ^ k;
                 if i < j && (i + 1) % bin_size == 0 {
-                    let sep = (base + k) as u64;
-
-                    let cur_bin_num = [i / bin_size, j / bin_size];
-                    for c in [0, 1] {
-                        pull_bin::<DataSize, MetaSize>(
-                            aes_key,
-                            hash_key,
-                            freshness_nonce,
-                            shuffle_id,
-                            cur_bin_num[c],
-                            num_bins,
-                            1,
-                            &mut 0,
-                            &mut Vec::new(),
-                            &mut meta[c * bin_size..(c + 1) * bin_size],
-                            &mut Vec::new(),
-                        );
+                    let mut tid = idle_threads.lock().unwrap().pop_front();
+                    while tid.is_none() {
+                        thread::sleep(Duration::from_micros(100));
+                        tid = idle_threads.lock().unwrap().pop_front();
                     }
-                    //oblivious placement across bins
-                    let split_meta_mut = meta.split_at_mut(bin_size);
-                    for (item_left, item_right) in
-                        split_meta_mut.0.iter_mut().zip(split_meta_mut.1.iter_mut())
-                    {
-                        core_f(item_left, item_right, sep, 0, key_by, invalid_addr);
-                    }
-
-                    {
-                        //oblivious placement inside bins
-                        if k == bin_size {
-                            place_inside_bin(
-                                split_meta_mut.0,
-                                (cur_bin_num[0] * bin_size) as u64,
-                                key_by,
-                                invalid_addr,
-                            );
-                            place_inside_bin(
-                                split_meta_mut.1,
-                                (cur_bin_num[1] * bin_size) as u64,
-                                key_by,
-                                invalid_addr,
-                            );
-                            if is_rehearsal {
-                                for meta_item in split_meta_mut
-                                    .0
-                                    .iter_mut()
-                                    .chain(split_meta_mut.1.iter_mut())
-                                {
-                                    meta_item.as_mut_ne_u64_slice()[key_by] = expected_new_idx;
-                                    expected_new_idx += 1;
-                                }
-                            }
-                        }
-                    }
-                    for c in [0, 1] {
-                        push_bin::<_, DataSize, MetaSize>(
-                            aes_key,
-                            hash_key,
-                            freshness_nonce,
-                            shuffle_id,
-                            cur_bin_num[c],
-                            1,
-                            &mut Vec::new(),
-                            &mut meta[c * bin_size..(c + 1) * bin_size],
-                            &mut Vec::new(),
-                            num_bins,
-                            rng,
-                        );
-                    }
+                    handlers_map
+                        .get(&tid.unwrap())
+                        .unwrap()
+                        .send((i, k, base))
+                        .unwrap();
                 }
             }
-            helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
+            while idle_threads.lock().unwrap().len() < NUM_THREADS {
+                thread::sleep(Duration::from_micros(1000));
+            }
+            helpers::bin_switch_ocall(shuffle_id);
             k >>= 1;
+        }
+
+        drop(handlers_map);
+        for handler in handlers {
+            handler.join().unwrap();
         }
     }
 }
@@ -2677,26 +2304,26 @@ fn patch_meta<Rng, DataSize, MetaSize>(
             hash_key,
             &seal_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             num_bins,
             0,
             &mut 0,
             &mut Vec::new(),
             &mut original_meta,
-            &mut Vec::new(),
         );
         pull_bin::<DataSize, MetaSize>(
             aes_key,
             hash_key,
             &freshness_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             num_bins,
             1,
             &mut 0,
             &mut Vec::new(),
             &mut modified_meta,
-            &mut Vec::new(),
         );
 
         for i in 0..bin_size {
@@ -2711,16 +2338,16 @@ fn patch_meta<Rng, DataSize, MetaSize>(
             hash_key,
             &seal_nonce,
             shuffle_id,
+            0,
             cur_bin_num,
             0,
             &mut Vec::new(),
             &mut original_meta,
-            &mut Vec::new(),
             num_bins,
             rng,
         );
     }
-    helpers::bin_switch_ocall(shuffle_id, 0, num_bins);
+    helpers::bin_switch_ocall(shuffle_id);
 }
 
 fn shuffle_core<Rng, DataSize, MetaSize, Z>(
@@ -2752,13 +2379,12 @@ fn shuffle_core<Rng, DataSize, MetaSize, Z>(
     println!("finish oblivious push tmp posmap, {:?}s", dur);
 
     let now = Instant::now();
-    bucket_oblivious_sort::<_, DataSize, MetaSize, Z>(
+    bin_bitonic_sort::<_, DataSize, MetaSize>(
         aes_key,
         hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
-        0,
         2,
         false,
         rng,
@@ -2775,20 +2401,18 @@ fn shuffle_core<Rng, DataSize, MetaSize, Z>(
         shuffle_id,
         log2_ceil(count),
         num_bins,
-        0,
         rng,
     );
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("finish push location upwards, {:?}s", dur);
 
     let now = Instant::now();
-    bucket_oblivious_sort::<_, DataSize, MetaSize, Z>(
+    bin_bitonic_sort::<_, DataSize, MetaSize>(
         aes_key,
         hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
-        0,
         2,
         false,
         rng,
@@ -2828,13 +2452,12 @@ fn shuffle_core<Rng, DataSize, MetaSize, Z>(
 
     let now = Instant::now();
     //bucket oblivious sort info by old idx
-    bucket_oblivious_sort::<_, DataSize, MetaSize, Z>(
+    bin_bitonic_sort::<_, DataSize, MetaSize>(
         aes_key,
         hash_key,
         &freshness_nonce,
         shuffle_id,
         num_bins,
-        0,
         1,
         false,
         rng,
@@ -2861,13 +2484,12 @@ fn shuffle_core<Rng, DataSize, MetaSize, Z>(
     //TODO: maybe both seal_nonce and freshness nonce are needed
     //because loading the seperate data and meta bins needs seal_nonce
     //while loading the intermediate bins needs freshness_nonce
-    bucket_oblivious_sort::<_, DataSize, MetaSize, Z>(
+    bin_bitonic_sort::<_, DataSize, MetaSize>(
         aes_key,
         hash_key,
         &seal_nonce,
         shuffle_id,
         num_bins,
-        0,
         2,
         true,
         rng,
@@ -2920,12 +2542,12 @@ mod helpers {
     // Helper for invoking the pull shuffle bin OCALL safely
     pub fn shuffle_pull_bin_ocall<DataSize, MetaSize>(
         shuffle_id: u64,
+        tid: usize,
         cur_bin_num: usize,
         bin_type: u8,
         bin_size: &mut usize,
         data: &mut [A64Bytes<DataSize>],
         meta: &mut [A8Bytes<MetaSize>],
-        random_keys: &mut [u64],
         nonce: &mut GenericArray<u8, NonceSize>,
         hash: &mut Hash,
     ) where
@@ -2935,12 +2557,12 @@ mod helpers {
         use std::cmp::min;
         let mut data_ptr = 0;
         let mut meta_ptr = 0;
-        let mut random_key_ptr = 0;
         let mut nonce_ptr = 0;
         let mut hash_ptr = 0;
         unsafe {
             super::shuffle_pull_bin(
                 shuffle_id,
+                tid,
                 cur_bin_num,
                 bin_type,
                 bin_size,
@@ -2948,32 +2570,26 @@ mod helpers {
                 MetaSize::USIZE,
                 (data.len() > 0) as u8,
                 (meta.len() > 0) as u8,
-                (random_keys.len() > 0) as u8,
                 nonce.len(),
                 hash.len(),
                 &mut data_ptr,
                 &mut meta_ptr,
-                &mut random_key_ptr,
                 &mut nonce_ptr,
                 &mut hash_ptr,
             );
 
             let src_data_buf = (data_ptr as *mut Vec<u8>).as_ref().unwrap();
             let src_meta_buf = (meta_ptr as *mut Vec<u8>).as_ref().unwrap();
-            let src_random_key_buf = (random_key_ptr as *mut Vec<u8>).as_ref().unwrap();
             let src_nonce_buf = (nonce_ptr as *mut Vec<u8>).as_ref().unwrap();
             let src_hash_buf = (hash_ptr as *mut Vec<u8>).as_ref().unwrap();
 
             let data_size = min(data.len(), *bin_size) * DataSize::USIZE;
             let meta_size = min(meta.len(), *bin_size) * MetaSize::USIZE;
-            let random_key_size = min(random_keys.len(), *bin_size) * 8;
 
             core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data_size)
                 .copy_from_slice(src_data_buf);
             core::slice::from_raw_parts_mut(meta.as_mut_ptr() as *mut u8, meta_size)
                 .copy_from_slice(src_meta_buf);
-            core::slice::from_raw_parts_mut(random_keys.as_mut_ptr() as *mut u8, random_key_size)
-                .copy_from_slice(src_random_key_buf);
             nonce.copy_from_slice(src_nonce_buf);
             hash.copy_from_slice(src_hash_buf);
         }
@@ -2985,6 +2601,7 @@ mod helpers {
         MetaSize: ArrayLength<u8> + PartialDiv<U8>,
     >(
         shuffle_id: u64,
+        tid: usize,
         b_idx: usize,
         e_idx: usize,
         data: &[A64Bytes<DataSize>],
@@ -3000,6 +2617,7 @@ mod helpers {
         unsafe {
             super::shuffle_push_buckets_pre(
                 shuffle_id,
+                tid,
                 data_size,
                 meta_size,
                 &mut data_ptr,
@@ -3017,18 +2635,18 @@ mod helpers {
                 meta_size,
             ));
 
-            super::shuffle_push_buckets(shuffle_id, b_idx, e_idx);
+            super::shuffle_push_buckets(shuffle_id, tid, b_idx, e_idx);
         }
     }
 
     // Helper for invoking the push shuffle bin OCALL safely
     pub fn shuffle_push_bin_ocall<DataSize, MetaSize>(
         shuffle_id: u64,
+        tid: usize,
         cur_bin_num: usize,
         bin_type: u8,
         data: &[A64Bytes<DataSize>],
         meta: &[A8Bytes<MetaSize>],
-        random_keys: &[u64],
         nonce: &GenericArray<u8, NonceSize>,
         hash: &Hash,
     ) where
@@ -3037,32 +2655,28 @@ mod helpers {
     {
         let mut data_ptr = 0;
         let mut meta_ptr = 0;
-        let mut random_key_ptr = 0;
         let mut nonce_ptr = 0;
         let mut hash_ptr = 0;
         let data_size = data.len() * DataSize::USIZE;
         let meta_size = meta.len() * MetaSize::USIZE;
-        let random_key_size = random_keys.len() * 8;
         let nonce_size = nonce.len();
         let hash_size = hash.len();
         unsafe {
             super::shuffle_push_bin_pre(
                 shuffle_id,
+                tid,
                 data_size,
                 meta_size,
-                random_key_size,
                 nonce_size,
                 hash_size,
                 &mut data_ptr,
                 &mut meta_ptr,
-                &mut random_key_ptr,
                 &mut nonce_ptr,
                 &mut hash_ptr,
             );
 
             let dst_data_buf = (data_ptr as *mut Vec<u8>).as_mut().unwrap();
             let dst_meta_buf = (meta_ptr as *mut Vec<u8>).as_mut().unwrap();
-            let dst_random_key_buf = (random_key_ptr as *mut Vec<u8>).as_mut().unwrap();
             let dst_nonce_buf = (nonce_ptr as *mut Vec<u8>).as_mut().unwrap();
             let dst_hash_buf = (hash_ptr as *mut Vec<u8>).as_mut().unwrap();
             dst_data_buf.copy_from_slice(core::slice::from_raw_parts(
@@ -3073,18 +2687,14 @@ mod helpers {
                 meta.as_ptr() as *mut u8,
                 meta_size,
             ));
-            dst_random_key_buf.copy_from_slice(core::slice::from_raw_parts(
-                random_keys.as_ptr() as *mut u8,
-                random_key_size,
-            ));
             dst_nonce_buf.copy_from_slice(nonce);
             dst_hash_buf.copy_from_slice(hash);
 
-            super::shuffle_push_bin(shuffle_id, cur_bin_num, bin_type);
+            super::shuffle_push_bin(shuffle_id, tid, cur_bin_num, bin_type);
         }
     }
 
-    pub fn bin_switch_ocall(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx: usize) {
+    pub fn bin_switch_ocall(shuffle_id: u64) {
         let src_bins = SRC_BINS.read().unwrap();
         let dst_bins = DST_BINS.read().unwrap();
         for (i, bin) in dst_bins.iter().enumerate() {
@@ -3093,7 +2703,26 @@ mod helpers {
             *src_bin = std::mem::take(&mut *dst_bin);
         }
         unsafe {
-            bin_switch(shuffle_id, begin_bin_idx, end_bin_idx);
+            bin_switch(shuffle_id);
+        }
+    }
+
+    pub fn set_fixed_bin_size_ocall(
+        shuffle_id: u64,
+        data_size_in_bucket: u64,
+        meta_size_in_bucket: u64,
+        bin_size_in_bucket: u64,
+    ) {
+        unsafe {
+            set_fixed_bin_size(
+                shuffle_id,
+                (8 + data_size_in_bucket + NonceSize::U64 + 16) * bin_size_in_bucket,
+                (8 + meta_size_in_bucket + NonceSize::U64 + 16) * bin_size_in_bucket,
+                (16 + data_size_in_bucket + meta_size_in_bucket + NonceSize::U64 + 16)
+                    * bin_size_in_bucket,
+                (16 + data_size_in_bucket + meta_size_in_bucket + NonceSize::U64 + 16)
+                    * bin_size_in_bucket,
+            );
         }
     }
 }
@@ -3113,6 +2742,7 @@ extern "C" {
     //use the stash
     fn shuffle_pull_bin(
         shuffle_id: u64,
+        tid: usize,
         cur_bin_num: usize,
         bin_type: u8,
         bin_size: *mut usize,
@@ -3120,41 +2750,39 @@ extern "C" {
         meta_item_size: usize,
         has_data: u8,
         has_meta: u8,
-        has_random_key: u8,
         nonce_size: usize,
         hash_size: usize,
         data_ptr: *mut usize,
         meta_ptr: *mut usize,
-        random_key_ptr: *mut usize,
         nonce_ptr: *mut usize,
         hash_ptr: *mut usize,
     );
     fn shuffle_push_buckets_pre(
         shuffle_id: u64,
+        tid: usize,
         data_size: usize,
         meta_size: usize,
         data_ptr: *mut usize,
         meta_ptr: *mut usize,
     );
-    fn shuffle_push_buckets(shuffle_id: u64, b_idx: usize, e_idx: usize);
+    fn shuffle_push_buckets(shuffle_id: u64, tid: usize, b_idx: usize, e_idx: usize);
     //since only shuffle_push_bin occurs unexpected bugs
     //i.e., the ocall is not called acutally, so we split
     //the function into two parts
     //allocate buffer
     fn shuffle_push_bin_pre(
         shuffle_id: u64,
+        tid: usize,
         data_size: usize,
         meta_size: usize,
-        random_key_size: usize,
         nonce_size: usize,
         hash_size: usize,
         data_ptr: *mut usize,
         meta_ptr: *mut usize,
-        random_key_ptr: *mut usize,
         nonce_ptr: *mut usize,
         hash_ptr: *mut usize,
     );
-    fn shuffle_push_bin(shuffle_id: u64, cur_bin_num: usize, bin_type: u8);
+    fn shuffle_push_bin(shuffle_id: u64, tid: usize, cur_bin_num: usize, bin_type: u8);
     fn shuffle_push_tmp_posmap(
         data_size: usize,
         nonce_size: usize,
@@ -3167,7 +2795,15 @@ extern "C" {
     fn shuffle_release_tmp_posmap();
 
     //move the dst bin to src bin, and assert that the src bin is empty now
-    fn bin_switch(shuffle_id: u64, begin_bin_idx: usize, end_bin_idx: usize);
+    fn bin_switch(shuffle_id: u64);
+    //fix bin size for files
+    fn set_fixed_bin_size(
+        shuffle_id: u64,
+        data_bin_size: u64,
+        meta_bin_size: u64,
+        src_bin_size: u64,
+        dst_bin_size: u64,
+    );
     //clear all unneccessary content
     fn clear_content(shuffle_id: u64);
 
