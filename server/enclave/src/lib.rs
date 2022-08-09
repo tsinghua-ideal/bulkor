@@ -21,6 +21,7 @@
 #![cfg_attr(target_env = "sgx", feature(rustc_private))]
 #![feature(box_syntax)]
 #![feature(cell_update)]
+#![feature(int_log)]
 
 #[cfg(not(target_env = "sgx"))]
 #[macro_use]

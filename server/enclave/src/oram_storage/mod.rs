@@ -74,8 +74,8 @@ lazy_static! {
     /// NOTE: it influences the setting of StackMaxSize
 
     //pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(25u32); // 32 MB
-    pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(20u32); // 1 MB
-    pub static ref TREEMID_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(33u32); // 8 GB
+    pub static ref TREETOP_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(24u32); // 16 MB
+    pub static ref TREEMID_CACHING_THRESHOLD_LOG2: AtomicU32 = AtomicU32::new(33u32-1u32.log2()); // 8 GB
     pub static ref IN_ENCLAVE_RATIO: usize = (TREEMID_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)/TREETOP_CACHING_THRESHOLD_LOG2.load(Ordering::SeqCst)) as usize;
 
     // An extra mutex which we lock across our OCALLs, this is done to detect if the untrusted
