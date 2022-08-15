@@ -126,10 +126,10 @@ impl ShuffleManager {
         println!("release the memory successfully? {:?}", release_mem == 1);
     }
 
-    pub fn pull_buckets(&mut self, b_idx: usize, e_idx: usize, data: &mut [u8], meta: &mut [u8]) {
+    pub fn pull_buckets(&self, b_idx: usize, e_idx: usize, data: &mut [u8], meta: &mut [u8]) {
         let storage = unsafe {
-            core::mem::transmute::<_, *mut UntrustedAllocation>(self.storage_id)
-                .as_mut()
+            core::mem::transmute::<_, *const UntrustedAllocation>(self.storage_id)
+                .as_ref()
                 .unwrap()
         };
 
@@ -340,10 +340,10 @@ impl ShuffleManager {
         .unwrap();
     }
 
-    pub fn push_buckets(&mut self, tid: usize, b_idx: usize, e_idx: usize) {
+    pub fn push_buckets(&self, tid: usize, b_idx: usize, e_idx: usize) {
         let storage = unsafe {
-            core::mem::transmute::<_, *mut UntrustedAllocation>(self.storage_id)
-                .as_mut()
+            core::mem::transmute::<_, *const UntrustedAllocation>(self.storage_id)
+                .as_ref()
                 .unwrap()
         };
 
@@ -354,6 +354,7 @@ impl ShuffleManager {
         let data_item_size = self.data_size;
         let meta_item_size = self.meta_size;
         let count_in_mem = storage.count_in_mem;
+        //expect no confliction
         let data_mut = unsafe {
             core::slice::from_raw_parts_mut(storage.data_pointer, 2 * count_in_mem * data_item_size)
         };
@@ -386,14 +387,13 @@ impl ShuffleManager {
                     )
                     .unwrap();
             }
-            set_ptr(&mut storage.ptrs, idx, p);
         }
 
         for (count, idx) in (b_idx..e_idx).into_iter().enumerate() {
-            let (sts_on_disk, _, p) = get_sts_ptr(&storage.ptrs, idx);
-            //already set above
-            assert!(sts_on_disk);
+            let (sts_on_disk, _, mut p) = get_sts_ptr(&storage.ptrs, idx);
+            assert!(!sts_on_disk);
             if idx < count_in_mem {
+                p = p ^ 1;
                 (&mut meta_mut[meta_item_size * (idx * 2 + p)..meta_item_size * (idx * 2 + p + 1)])
                     .clone_from_slice(&meta[meta_item_size * count..meta_item_size * (count + 1)]);
                 (&mut meta_mut[meta_item_size * (idx * 2 + (p ^ 1))
@@ -407,6 +407,7 @@ impl ShuffleManager {
                 //     )
                 //     .unwrap();
             } else {
+                p = (p + 1) % 3;
                 storage
                     .meta_file
                     .write_all_at(

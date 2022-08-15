@@ -53,7 +53,7 @@ fn encrypt_bucket_and_pre_authenticate<DataSize, MetaSize>(
     block_ctr: u64,
     meta_plus_extra: &mut Vec<A8Bytes<Sum<MetaSize, ExtraMetaSize>>>,
     treetop_max_count: usize,
-    trusted_merkle_roots: &mut Vec<Hash>,
+    trusted_merkle_roots: &Arc<Mutex<Vec<Hash>>>,
 ) -> Hash
 where
     DataSize: ArrayLength<u8> + PowerOfTwo + PartialDiv<U8>,
@@ -74,7 +74,7 @@ where
 
     // Check with trusted merkle root if this is the last treetop index
     if idx < 2 * treetop_max_count as usize {
-        trusted_merkle_roots[idx] = this_block_hash;
+        trusted_merkle_roots.lock().unwrap()[idx] = this_block_hash;
     }
 
     this_block_hash
@@ -430,8 +430,8 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
     shuffle_id: u64,
     count: u64,
     treetop_max_count: usize,
-    treetop: &mut HeapORAMStorage<DataSize, MetaSize, Z>,
-    trusted_merkle_roots: &mut Vec<Hash>,
+    treetop: Arc<HeapORAMStorage<DataSize, MetaSize, Z>>,
+    trusted_merkle_roots: Arc<Vec<Hash>>,
     num_bins: usize,
     bin_size_in_bucket_real: usize,
     rng: &mut Rng,
@@ -446,10 +446,6 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
     let now = Instant::now();
     //reassign bin_size_in_bucket because we don't pad now
     let bin_size_in_bucket = bin_size_in_bucket_real;
-    let mut cur_bin_num = num_bins - 1;
-    let mut e_count = count as usize;
-    let mut b_count = e_count >> 1;
-
     let num_bins_encl = (num_bins - 1) / *IN_ENCLAVE_RATIO + 1;
     DATA_BIN_BUF
         .write()
@@ -466,11 +462,167 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
         Arc::new(Mutex::new((Vec::new(), Vec::new())))
     });
 
-    let mut prev_tier_hash: Hash = Default::default();
+    let mut handlers = Vec::new();
+    let idle_threads = Arc::new(Mutex::new((0..NUM_THREADS).collect::<VecDeque<_>>()));
+    let mut handlers_map = HashMap::new();
+    for tid in 0..NUM_THREADS {
+        let aes_key = aes_key.clone();
+        let hash_key = hash_key.clone();
+        let seal_nonce = seal_nonce.clone();
+        let freshness_nonce = freshness_nonce.clone();
+        let trusted_merkle_roots = trusted_merkle_roots.clone();
+        let treetop = treetop.clone();
+        let idle_threads = idle_threads.clone();
+        let (tx, rx) = sync_channel::<(usize, usize, usize, Arc<Mutex<Vec<Hash>>>, Vec<Hash>)>(0);
+        handlers_map.insert(tid, tx);
+        let mut rng = rng_maker(get_seeded_rng())();
+        let builder = thread::Builder::new();
+        let handler = builder
+            .spawn(move || {
+                for (e_idx, e_count, cur_bin_num, bin_hashes, child_bin_hashes) in rx {
+                    let mut data: Vec<A64Bytes<DataSize>> =
+                        vec![Default::default(); bin_size_in_bucket];
+                    let mut meta: Vec<A8Bytes<MetaSize>> =
+                        vec![Default::default(); bin_size_in_bucket];
+                    let mut meta_plus_extra: Vec<A8Bytes<Sum<MetaSize, ExtraMetaSize>>> =
+                        vec![Default::default(); bin_size_in_bucket];
+                    let b_idx = e_idx - bin_size_in_bucket;
+                    let mut delta = bin_size_in_bucket;
+                    if e_idx > treetop_max_count {
+                        delta = treetop_max_count.saturating_sub(b_idx);
+                        assert_eq!(delta, 0);
+                        helpers::shuffle_pull_buckets_ocall(
+                            shuffle_id,
+                            b_idx + delta,
+                            e_idx,
+                            &mut data[delta..],
+                            &mut meta_plus_extra[delta..],
+                        );
+                        //decrypt data and meta, and verify
+                        for i in (delta..bin_size_in_bucket).rev() {
+                            if meta_plus_extra[i] != Default::default() {
+                                let idx = b_idx + i; //bucket idx
+                                let (this_block_hash, extra_meta) = decrypt_bucket_and_pre_verify(
+                                    idx,
+                                    i,
+                                    &aes_key,
+                                    &hash_key,
+                                    &mut data,
+                                    &mut meta,
+                                    &mut meta_plus_extra,
+                                    treetop_max_count,
+                                    &trusted_merkle_roots,
+                                );
+                                // If this block has a child, check if its hash that we computed before matches
+                                // metadata.
 
+                                if e_count < count as usize {
+                                    if extra_meta.right_child_hash != Hash::default() {
+                                        assert_eq!(
+                                            child_bin_hashes[i * 2 + 1],
+                                            extra_meta.right_child_hash
+                                        );
+                                    }
+                                    if extra_meta.left_child_hash != Hash::default() {
+                                        assert_eq!(
+                                            child_bin_hashes[i * 2],
+                                            extra_meta.left_child_hash
+                                        );
+                                    }
+                                }
+                                //authenticate the hashes because the hashes are stored in untrusted domain
+                                if b_idx >= 2 * treetop_max_count
+                                    && this_block_hash != Hash::default()
+                                {
+                                    bin_hashes.lock().unwrap()[i] = this_block_hash;
+                                }
+                            }
+                        }
+                    }
+                    //copy from treetop to the buffers above
+                    //copy is necessary because the original meta should be kept
+                    //no need to decrypt and verify
+                    if b_idx < treetop_max_count {
+                        (&mut data[..delta]).clone_from_slice(&treetop.data[b_idx..b_idx + delta]);
+                        (&mut meta[..delta])
+                            .clone_from_slice(&treetop.metadata[b_idx..b_idx + delta]);
+                    }
+
+                    //write data and meta back separately with encryption and authentication
+                    //in the untrusted domain, data may saved on disk, while meta almost in memory for further process
+                    let mut original_meta = meta.clone();
+
+                    push_bin::<_, DataSize, MetaSize>(
+                        &aes_key,
+                        &hash_key,
+                        &seal_nonce,
+                        shuffle_id,
+                        tid,
+                        cur_bin_num,
+                        0,
+                        &mut data,
+                        &mut Vec::new(),
+                        num_bins,
+                        &mut rng,
+                    );
+                    push_bin::<_, DataSize, MetaSize>(
+                        &aes_key,
+                        &hash_key,
+                        &seal_nonce,
+                        shuffle_id,
+                        tid,
+                        cur_bin_num,
+                        0,
+                        &mut Vec::new(),
+                        &mut original_meta,
+                        num_bins,
+                        &mut rng,
+                    );
+
+                    //compute new idx from block num
+                    reformat_metadata_first(count, b_idx, &mut meta, &mut rng);
+                    //although the DataSize, MetaSize is not consistent with subsequent
+                    //pull_bin and push_bin in bucket oblivious sort, it does not matter
+                    push_bin::<_, DataSize, MetaSize>(
+                        &aes_key,
+                        &hash_key,
+                        &freshness_nonce,
+                        shuffle_id,
+                        tid,
+                        cur_bin_num,
+                        1,
+                        &mut Vec::new(),
+                        &mut meta,
+                        num_bins,
+                        &mut rng,
+                    );
+
+                    idle_threads.lock().unwrap().push_back(tid);
+                }
+            })
+            .unwrap();
+        handlers.push(handler);
+    }
+
+    let mut cur_bin_num = num_bins - 1;
+    let mut e_count = count as usize;
+    let mut b_count = e_count >> 1;
+    let mut hashes = Vec::new();
+    let mut prev_hashes = hashes.clone();
     while b_count > 0 {
         let mut e_idx = e_count;
+        hashes.resize_with((e_count - b_count) / bin_size_in_bucket, || {
+            Arc::new(Mutex::new(vec![Hash::default(); bin_size_in_bucket]))
+        });
         if e_count <= bin_size_in_bucket {
+            let child_bin_hashes = if count as usize <= bin_size_in_bucket {
+                vec![Hash::default(); bin_size_in_bucket]
+            } else {
+                assert_eq!(prev_hashes.len(), 1);
+                std::mem::take(&mut *prev_hashes[0].lock().unwrap())
+            };
+
+            //no need to parallelize at bin level
             assert_eq!(e_idx, bin_size_in_bucket);
             assert_eq!(cur_bin_num, 0);
             let mut data: Vec<A64Bytes<DataSize>> = vec![Default::default(); bin_size_in_bucket];
@@ -490,8 +642,6 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                     &mut meta_plus_extra[bin_size_in_bucket - delta..],
                 );
                 while b_count >= treetop_max_count {
-                    let mut prev_tier_hasher = Blake2b::new();
-                    prev_tier_hasher.update(hash_key);
                     for i in (b_count..e_count).rev() {
                         if meta_plus_extra[i] != Default::default() {
                             let idx = b_idx + i;
@@ -504,16 +654,19 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                                 &mut meta,
                                 &mut meta_plus_extra,
                                 treetop_max_count,
-                                trusted_merkle_roots,
+                                &trusted_merkle_roots,
                             );
                             // If this block has a child, check if its hash that we computed before matches
                             // metadata. And we should verify the prev_hashes before assertion.
                             if is_bottom_in_bucket && e_count < count as usize {
                                 if extra_meta.right_child_hash != Hash::default() {
-                                    prev_tier_hasher.update(&extra_meta.right_child_hash);
+                                    assert_eq!(
+                                        child_bin_hashes[i * 2 + 1],
+                                        extra_meta.right_child_hash
+                                    );
                                 }
                                 if extra_meta.left_child_hash != Hash::default() {
-                                    prev_tier_hasher.update(&extra_meta.left_child_hash);
+                                    assert_eq!(child_bin_hashes[i * 2], extra_meta.left_child_hash);
                                 }
                             }
                             // No need to authenticate the block hash, no need for additionally storing hashes anymore
@@ -530,12 +683,6 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
                             }
                         }
                     }
-                    //if the current tier is not the lowest tier but is the lowest tier in the bucket
-                    if is_bottom_in_bucket && e_count < count as usize {
-                        let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
-                        assert_eq!(prev_tier_hash, h);
-                    }
-
                     is_bottom_in_bucket = false;
                     e_count = b_count;
                     b_count >>= 1;
@@ -594,130 +741,47 @@ fn pull_oram_buckets<Rng, DataSize, MetaSize, Z>(
             );
             b_count = 0;
         } else {
-            let mut cur_tier_hasher = Blake2b::new();
-            let mut prev_tier_hasher = Blake2b::new();
-            cur_tier_hasher.update(hash_key);
-            prev_tier_hasher.update(hash_key);
             while e_idx > b_count {
-                let mut data: Vec<A64Bytes<DataSize>> =
-                    vec![Default::default(); bin_size_in_bucket];
-                let mut meta: Vec<A8Bytes<MetaSize>> = vec![Default::default(); bin_size_in_bucket];
-                let mut meta_plus_extra: Vec<A8Bytes<Sum<MetaSize, ExtraMetaSize>>> =
-                    vec![Default::default(); bin_size_in_bucket];
-                let b_idx = e_idx - bin_size_in_bucket;
-                let mut delta = bin_size_in_bucket;
-                if e_idx > treetop_max_count {
-                    delta = treetop_max_count.saturating_sub(b_idx);
-                    assert_eq!(delta, 0);
-                    helpers::shuffle_pull_buckets_ocall(
-                        shuffle_id,
-                        b_idx + delta,
-                        e_idx,
-                        &mut data[delta..],
-                        &mut meta_plus_extra[delta..],
-                    );
-                    //decrypt data and meta, and verify
-                    for i in (delta..bin_size_in_bucket).rev() {
-                        if meta_plus_extra[i] != Default::default() {
-                            let idx = b_idx + i; //bucket idx
-                            let (this_block_hash, extra_meta) = decrypt_bucket_and_pre_verify(
-                                idx,
-                                i,
-                                aes_key,
-                                hash_key,
-                                &mut data,
-                                &mut meta,
-                                &mut meta_plus_extra,
-                                treetop_max_count,
-                                trusted_merkle_roots,
-                            );
-                            // If this block has a child, check if its hash that we computed before matches
-                            // metadata.
+                let bin_hashes_loc = (e_idx - b_count) / bin_size_in_bucket - 1;
+                let bin_hashes = hashes[bin_hashes_loc].clone();
+                let child_bin_hashes = if e_count == count as usize {
+                    vec![Hash::default(); bin_size_in_bucket * 2]
+                } else {
+                    let mut child_bin_hashes =
+                        std::mem::take(&mut *prev_hashes[2 * bin_hashes_loc].lock().unwrap());
+                    child_bin_hashes
+                        .append(&mut *prev_hashes[2 * bin_hashes_loc + 1].lock().unwrap());
+                    child_bin_hashes
+                };
 
-                            if e_count < count as usize {
-                                if extra_meta.right_child_hash != Hash::default() {
-                                    prev_tier_hasher.update(&extra_meta.right_child_hash);
-                                }
-                                if extra_meta.left_child_hash != Hash::default() {
-                                    prev_tier_hasher.update(&extra_meta.left_child_hash);
-                                }
-                            }
-                            //authenticate the hashes because the hashes are stored in untrusted domain
-                            if b_idx >= 2 * treetop_max_count && this_block_hash != Hash::default()
-                            {
-                                cur_tier_hasher.update(&this_block_hash);
-                            }
-                        }
-                    }
+                let mut tid = idle_threads.lock().unwrap().pop_front();
+                while tid.is_none() {
+                    thread::sleep(Duration::from_micros(100));
+                    tid = idle_threads.lock().unwrap().pop_front();
                 }
-                //copy from treetop to the buffers above
-                //copy is necessary because the original meta should be kept
-                //no need to decrypt and verify
-                if b_idx < treetop_max_count {
-                    (&mut data[..delta]).clone_from_slice(&treetop.data[b_idx..b_idx + delta]);
-                    (&mut meta[..delta]).clone_from_slice(&treetop.metadata[b_idx..b_idx + delta]);
-                }
-
-                //write data and meta back separately with encryption and authentication
-                //in the untrusted domain, data may saved on disk, while meta almost in memory for further process
-                let mut original_meta = meta.clone();
-
-                push_bin::<_, DataSize, MetaSize>(
-                    aes_key,
-                    hash_key,
-                    seal_nonce,
-                    shuffle_id,
-                    0,
-                    cur_bin_num,
-                    0,
-                    &mut data,
-                    &mut Vec::new(),
-                    num_bins,
-                    rng,
-                );
-                push_bin::<_, DataSize, MetaSize>(
-                    aes_key,
-                    hash_key,
-                    seal_nonce,
-                    shuffle_id,
-                    0,
-                    cur_bin_num,
-                    0,
-                    &mut Vec::new(),
-                    &mut original_meta,
-                    num_bins,
-                    rng,
-                );
-
-                //compute new idx from block num
-                reformat_metadata_first(count, b_idx, &mut meta, rng);
-                //although the DataSize, MetaSize is not consistent with subsequent
-                //pull_bin and push_bin in bucket oblivious sort, it does not matter
-                push_bin::<_, DataSize, MetaSize>(
-                    aes_key,
-                    hash_key,
-                    freshness_nonce,
-                    shuffle_id,
-                    0,
-                    cur_bin_num,
-                    1,
-                    &mut Vec::new(),
-                    &mut meta,
-                    num_bins,
-                    rng,
-                );
+                handlers_map
+                    .get(&tid.unwrap())
+                    .unwrap()
+                    .send((e_idx, e_count, cur_bin_num, bin_hashes, child_bin_hashes))
+                    .unwrap();
 
                 cur_bin_num -= 1;
-                e_idx = b_idx;
+                e_idx -= bin_size_in_bucket;
             }
-            if e_count < count as usize {
-                let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
-                assert_eq!(prev_tier_hash, h);
+            while idle_threads.lock().unwrap().len() < NUM_THREADS {
+                thread::sleep(Duration::from_micros(1000));
             }
-            prev_tier_hash = cur_tier_hasher.finalize()[..16].try_into().unwrap();
+
+            prev_hashes = hashes;
+            hashes = Vec::new();
             e_count = b_count;
             b_count >>= 1;
         }
+    }
+
+    drop(handlers_map);
+    for handler in handlers {
+        handler.join().unwrap();
     }
 
     helpers::bin_switch_ocall(shuffle_id);
@@ -732,8 +796,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     allocation_id: u64,
     count: u64,
     treetop_max_count: usize,
-    treetop: &mut HeapORAMStorage<DataSize, MetaSize, Z>,
-    trusted_merkle_roots: &mut Vec<Hash>,
+    oram_treetop: &mut HeapORAMStorage<DataSize, MetaSize, Z>,
+    oram_trusted_merkle_roots: &mut Vec<Hash>,
     aes_key: &GenericArray<u8, KeySize>,
     hash_key: &GenericArray<u8, KeySize>,
     rng: &mut Rng,
@@ -749,6 +813,9 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
     Sum<MetaSize, Prod<Z, U8>>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
     Sum<Quot<MetaSize, Z>, U8>: ArrayLength<u8> + PartialDiv<U8> + Unsigned,
 {
+    let treetop = Arc::new(std::mem::take(oram_treetop));
+    let trusted_merkle_roots = Arc::new(std::mem::take(oram_trusted_merkle_roots));
+
     //seal nonce is needed to store original data and metadata
     let mut seal_nonce = GenericArray::<u8, NonceSize>::default();
     //freshness nonce should change every time a round in bucket oblivious sort is finished
@@ -793,8 +860,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
             shuffle_id,
             count,
             treetop_max_count,
-            treetop,
-            trusted_merkle_roots,
+            treetop.clone(),
+            trusted_merkle_roots.clone(),
             num_bins,
             bin_size_in_bucket_real,
             rng,
@@ -870,14 +937,20 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
         );
     }
 
+    let treetop = Arc::new(Mutex::new(Arc::try_unwrap(treetop).ok().unwrap()));
+    let trusted_merkle_roots = Arc::new(Mutex::new(Arc::try_unwrap(trusted_merkle_roots).unwrap()));
+
     let now = Instant::now();
     //authenticate blocks as in oram tree.
     {
+        //reassign bin_size_in_bucket because no pad now
+        let bin_size_in_bucket = bin_size_in_bucket_real;
         fn strip_counter_part<DataSize, SrcMetaSize, DstMetaSize, Z>(
             aes_key: &GenericArray<u8, KeySize>,
             hash_key: &GenericArray<u8, KeySize>,
             seal_nonce: &GenericArray<u8, NonceSize>,
             shuffle_id: u64,
+            tid: usize,
             cur_bin_num: usize,
             num_bins: usize,
             bin_size_in_bucket: usize,
@@ -898,7 +971,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 hash_key,
                 seal_nonce,
                 shuffle_id,
-                0,
+                tid,
                 cur_bin_num,
                 num_bins,
                 1,
@@ -929,6 +1002,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
             hash_key: &GenericArray<u8, KeySize>,
             seal_nonce: &GenericArray<u8, NonceSize>,
             shuffle_id: u64,
+            tid: usize,
             cur_bin_num: usize,
             num_bins: usize,
             bin_size_in_bucket: usize,
@@ -947,7 +1021,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                 hash_key,
                 seal_nonce,
                 shuffle_id,
-                0,
+                tid,
                 cur_bin_num,
                 num_bins,
                 1,
@@ -966,22 +1040,160 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
             (data, meta)
         }
 
-        //reassign bin_size_in_bucket because no pad now
-        let bin_size_in_bucket = bin_size_in_bucket_real;
+        let mut handlers = Vec::new();
+        let idle_threads = Arc::new(Mutex::new((0..NUM_THREADS).collect::<VecDeque<_>>()));
+        let mut handlers_map = HashMap::new();
+        for tid in 0..NUM_THREADS {
+            let aes_key = aes_key.clone();
+            let hash_key = hash_key.clone();
+            let seal_nonce = seal_nonce.clone();
+            let trusted_merkle_roots = trusted_merkle_roots.clone();
+            let treetop = treetop.clone();
+            let idle_threads = idle_threads.clone();
+            let (tx, rx) =
+                sync_channel::<(usize, usize, usize, Arc<Mutex<Vec<Hash>>>, Vec<Hash>)>(0);
+            handlers_map.insert(tid, tx);
+            let builder = thread::Builder::new();
+            let handler = builder
+                .spawn(move || {
+                    for (e_idx, e_count, cur_bin_num, bin_hashes, child_bin_hashes) in rx {
+                        let (mut data, meta) = if level > 0 {
+                            strip_counter_part::<DataSize, Sum<MetaSize, Prod<Z, U8>>, MetaSize, Z>(
+                                &aes_key,
+                                &hash_key,
+                                &seal_nonce,
+                                shuffle_id,
+                                tid,
+                                cur_bin_num,
+                                num_bins,
+                                bin_size_in_bucket,
+                            )
+                        } else {
+                            reset_counter_part(
+                                &aes_key,
+                                &hash_key,
+                                &seal_nonce,
+                                shuffle_id,
+                                tid,
+                                cur_bin_num,
+                                num_bins,
+                                bin_size_in_bucket,
+                            )
+                        };
+                        let mut meta_plus_extra: Vec<A8Bytes<Sum<MetaSize, ExtraMetaSize>>> =
+                            vec![Default::default(); bin_size_in_bucket];
+                        let b_idx = e_idx - bin_size_in_bucket;
+                        let mut delta = bin_size_in_bucket;
+                        if e_idx > treetop_max_count {
+                            delta = treetop_max_count.saturating_sub(b_idx);
+                            assert_eq!(delta, 0);
+                            //encrypt data and meta, and authenticate
+                            for i in (delta..bin_size_in_bucket).rev() {
+                                let idx = b_idx + i; //bucket_idx
+
+                                // Update the metadata field and extract the new block_ctr value so that we can encrypt
+                                // TODO: the block ctr should be larger than any previous version
+                                // now for convenience, we do not obey it
+                                let block_ctr = {
+                                    // Split extra_meta out of scratch buffer
+                                    let (meta_mut, extra_meta_mut) =
+                                        meta_plus_extra[i].split_at_mut(MetaSize::USIZE);
+
+                                    // Update the meta
+                                    meta_mut.copy_from_slice(&meta[i]);
+
+                                    // Update the extra_meta
+                                    let mut extra_meta_val = ExtraMeta::from(&*extra_meta_mut);
+
+                                    // If this block has a child, update extra_meta
+                                    // If this block has a child, check if its hash that we computed before matches
+                                    // metadata. And we should verify the prev_hashes before assertion.
+                                    if e_count < count as usize {
+                                        extra_meta_val.left_child_hash = child_bin_hashes[i * 2];
+                                        extra_meta_val.right_child_hash =
+                                            child_bin_hashes[i * 2 + 1];
+                                    }
+
+                                    // Update block_ctr value by incrementing it
+                                    extra_meta_val.block_ctr += 1;
+
+                                    // Serialize the ExtraMeta object to bytes and store them at extra_meta
+                                    let extra_meta_bytes =
+                                        GenericArray::<u8, ExtraMetaSize>::from(&extra_meta_val);
+                                    extra_meta_mut.copy_from_slice(extra_meta_bytes.as_slice());
+
+                                    // Return the block_ctr value to use for this encryption
+                                    extra_meta_val.block_ctr
+                                };
+
+                                let this_block_hash =
+                                    encrypt_bucket_and_pre_authenticate::<_, MetaSize>(
+                                        idx,
+                                        i,
+                                        &aes_key,
+                                        &hash_key,
+                                        &mut data,
+                                        block_ctr,
+                                        &mut meta_plus_extra,
+                                        treetop_max_count,
+                                        &trusted_merkle_roots,
+                                    );
+                                //authenticate the hashes because the hashes are stored in untrusted domain
+                                if b_idx >= 2 * treetop_max_count
+                                    && this_block_hash != Hash::default()
+                                {
+                                    bin_hashes.lock().unwrap()[i] = this_block_hash;
+                                }
+                            }
+                        }
+                        //copy from buffers to the treetop above
+                        //no need to encrypt and authenticate
+                        if b_idx < treetop_max_count {
+                            let mut treetop = treetop.lock().unwrap();
+                            (&mut treetop.data[b_idx..b_idx + delta])
+                                .clone_from_slice(&data[..delta]);
+                            (&mut treetop.metadata[b_idx..b_idx + delta])
+                                .clone_from_slice(&meta[..delta]);
+                        }
+
+                        //save the oram buckets
+                        helpers::shuffle_push_buckets_ocall(
+                            shuffle_id,
+                            tid,
+                            b_idx,
+                            e_idx,
+                            &data,
+                            &meta_plus_extra,
+                        );
+
+                        idle_threads.lock().unwrap().push_back(tid);
+                    }
+                })
+                .unwrap();
+            handlers.push(handler);
+        }
+
         let mut cur_bin_num = num_bins - 1;
         let mut e_count = count as usize;
         let mut b_count = e_count >> 1;
 
-        ALLOCATOR.set_switch(true);
-        let mut hashes = vec![Default::default(); b_count];
-        let mut prev_hashes: Vec<Hash> = Vec::new();
-        ALLOCATOR.set_switch(false);
-
-        let mut prev_tier_hash: Hash = Default::default();
+        let mut hashes = Vec::new();
+        let mut prev_hashes = hashes.clone();
 
         while b_count > 0 {
             let mut e_idx = e_count;
+            hashes.resize_with((e_count - b_count) / bin_size_in_bucket, || {
+                Arc::new(Mutex::new(vec![Hash::default(); bin_size_in_bucket]))
+            });
             if e_count <= bin_size_in_bucket {
+                let child_bin_hashes = if count as usize <= bin_size_in_bucket {
+                    vec![Hash::default(); bin_size_in_bucket]
+                } else {
+                    assert_eq!(prev_hashes.len(), 1);
+                    std::mem::take(&mut *prev_hashes[0].lock().unwrap())
+                };
+
+                //no need to parallelize at bin level
                 assert_eq!(cur_bin_num, 0);
                 let (mut data, mut meta) = if level > 0 {
                     strip_counter_part::<DataSize, Sum<MetaSize, Prod<Z, U8>>, MetaSize, Z>(
@@ -989,6 +1201,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                         hash_key,
                         &seal_nonce,
                         shuffle_id,
+                        0,
                         cur_bin_num,
                         num_bins,
                         bin_size_in_bucket,
@@ -999,6 +1212,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                         hash_key,
                         &seal_nonce,
                         shuffle_id,
+                        0,
                         cur_bin_num,
                         num_bins,
                         bin_size_in_bucket,
@@ -1015,8 +1229,6 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     let mut is_bottom_in_bucket = true;
                     while b_count >= treetop_max_count {
                         //encrypt data and meta, and authenticate
-                        let mut prev_tier_hasher = Blake2b::new();
-                        prev_tier_hasher.update(hash_key);
                         for i in (b_count..e_count).rev() {
                             let idx = b_idx + i;
 
@@ -1038,16 +1250,8 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                                 // If this block has a child, check if its hash that we computed before matches
                                 // metadata. And we should verify the prev_hashes before assertion.
                                 if is_bottom_in_bucket && e_count < count as usize {
-                                    let left_child_hash = prev_hashes[(idx << 1) - e_count];
-                                    let right_child_hash = prev_hashes[(idx << 1) + 1 - e_count];
-                                    if right_child_hash != Hash::default() {
-                                        prev_tier_hasher.update(right_child_hash);
-                                    }
-                                    if left_child_hash != Hash::default() {
-                                        prev_tier_hasher.update(left_child_hash);
-                                    }
-                                    extra_meta_val.left_child_hash = left_child_hash;
-                                    extra_meta_val.right_child_hash = right_child_hash;
+                                    extra_meta_val.left_child_hash = child_bin_hashes[i * 2];
+                                    extra_meta_val.right_child_hash = child_bin_hashes[i * 2 + 1];
                                 }
 
                                 // Update block_ctr value by incrementing it
@@ -1072,7 +1276,7 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                                 block_ctr,
                                 &mut meta_plus_extra,
                                 treetop_max_count,
-                                trusted_merkle_roots,
+                                &trusted_merkle_roots,
                             );
                             // No need to authenticate the block hash, no need for additionally storing hashes anymore
                             // we can just fill the metadata of parents
@@ -1088,11 +1292,6 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                                 }
                             }
                         }
-                        //if the current tier is not the lowest tier but is the lowest tier in the bucket
-                        if is_bottom_in_bucket && e_count < count as usize {
-                            let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
-                            assert_eq!(prev_tier_hash, h);
-                        }
 
                         is_bottom_in_bucket = false;
                         e_count = b_count;
@@ -1100,8 +1299,13 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
                     }
                 }
 
-                (&mut treetop.data[..e_idx - delta]).clone_from_slice(&data[..e_idx - delta]);
-                (&mut treetop.metadata[..e_idx - delta]).clone_from_slice(&meta[..e_idx - delta]);
+                {
+                    let mut treetop = treetop.lock().unwrap();
+                    (&mut treetop.data[..e_idx - delta]).clone_from_slice(&data[..e_idx - delta]);
+                    (&mut treetop.metadata[..e_idx - delta])
+                        .clone_from_slice(&meta[..e_idx - delta]);
+                }
+
                 //save the oram buckets
                 helpers::shuffle_push_buckets_ocall(
                     shuffle_id,
@@ -1114,149 +1318,59 @@ pub fn manage<DataSize, MetaSize, Z, Rng>(
 
                 b_count = 0;
             } else {
-                let mut cur_tier_hasher = Blake2b::new();
-                let mut prev_tier_hasher = Blake2b::new();
-                cur_tier_hasher.update(hash_key);
-                prev_tier_hasher.update(hash_key);
                 while e_idx > b_count {
-                    let (mut data, meta) = if level > 0 {
-                        strip_counter_part::<DataSize, Sum<MetaSize, Prod<Z, U8>>, MetaSize, Z>(
-                            aes_key,
-                            hash_key,
-                            &seal_nonce,
-                            shuffle_id,
-                            cur_bin_num,
-                            num_bins,
-                            bin_size_in_bucket,
-                        )
+                    let bin_hashes_loc = (e_idx - b_count) / bin_size_in_bucket - 1;
+                    let bin_hashes = hashes[bin_hashes_loc].clone();
+                    let child_bin_hashes = if e_count == count as usize {
+                        vec![Hash::default(); bin_size_in_bucket * 2]
                     } else {
-                        reset_counter_part(
-                            aes_key,
-                            hash_key,
-                            &seal_nonce,
-                            shuffle_id,
-                            cur_bin_num,
-                            num_bins,
-                            bin_size_in_bucket,
-                        )
+                        let mut child_bin_hashes =
+                            std::mem::take(&mut *prev_hashes[2 * bin_hashes_loc].lock().unwrap());
+                        child_bin_hashes
+                            .append(&mut *prev_hashes[2 * bin_hashes_loc + 1].lock().unwrap());
+                        child_bin_hashes
                     };
-                    let mut meta_plus_extra: Vec<A8Bytes<Sum<MetaSize, ExtraMetaSize>>> =
-                        vec![Default::default(); bin_size_in_bucket];
-                    let b_idx = e_idx - bin_size_in_bucket;
-                    let mut delta = bin_size_in_bucket;
-                    if e_idx > treetop_max_count {
-                        delta = treetop_max_count.saturating_sub(b_idx);
-                        assert_eq!(delta, 0);
-                        //encrypt data and meta, and authenticate
-                        for i in (delta..bin_size_in_bucket).rev() {
-                            let idx = b_idx + i; //bucket_idx
 
-                            // Update the metadata field and extract the new block_ctr value so that we can encrypt
-                            // TODO: the block ctr should be larger than any previous version
-                            // now for convenience, we do not obey it
-                            let block_ctr = {
-                                // Split extra_meta out of scratch buffer
-                                let (meta_mut, extra_meta_mut) =
-                                    meta_plus_extra[i].split_at_mut(MetaSize::USIZE);
-
-                                // Update the meta
-                                meta_mut.copy_from_slice(&meta[i]);
-
-                                // Update the extra_meta
-                                let mut extra_meta_val = ExtraMeta::from(&*extra_meta_mut);
-
-                                // If this block has a child, update extra_meta
-                                // If this block has a child, check if its hash that we computed before matches
-                                // metadata. And we should verify the prev_hashes before assertion.
-                                if e_count < count as usize {
-                                    let left_child_hash = prev_hashes[(idx << 1) - e_count];
-                                    let right_child_hash = prev_hashes[(idx << 1) + 1 - e_count];
-                                    if right_child_hash != Hash::default() {
-                                        prev_tier_hasher.update(right_child_hash);
-                                    }
-                                    if left_child_hash != Hash::default() {
-                                        prev_tier_hasher.update(left_child_hash);
-                                    }
-                                    extra_meta_val.left_child_hash = left_child_hash;
-                                    extra_meta_val.right_child_hash = right_child_hash;
-                                }
-
-                                // Update block_ctr value by incrementing it
-                                extra_meta_val.block_ctr += 1;
-
-                                // Serialize the ExtraMeta object to bytes and store them at extra_meta
-                                let extra_meta_bytes =
-                                    GenericArray::<u8, ExtraMetaSize>::from(&extra_meta_val);
-                                extra_meta_mut.copy_from_slice(extra_meta_bytes.as_slice());
-
-                                // Return the block_ctr value to use for this encryption
-                                extra_meta_val.block_ctr
-                            };
-
-                            let this_block_hash = encrypt_bucket_and_pre_authenticate::<_, MetaSize>(
-                                idx,
-                                i,
-                                aes_key,
-                                hash_key,
-                                &mut data,
-                                block_ctr,
-                                &mut meta_plus_extra,
-                                treetop_max_count,
-                                trusted_merkle_roots,
-                            );
-                            //authenticate the hashes because the hashes are stored in untrusted domain
-                            if b_idx >= 2 * treetop_max_count && this_block_hash != Hash::default()
-                            {
-                                cur_tier_hasher.update(this_block_hash);
-                                hashes[idx - b_count] = this_block_hash;
-                            }
-                        }
+                    let mut tid = idle_threads.lock().unwrap().pop_front();
+                    while tid.is_none() {
+                        thread::sleep(Duration::from_micros(100));
+                        tid = idle_threads.lock().unwrap().pop_front();
                     }
-                    //copy from buffers to the treetop above
-                    //no need to encrypt and authenticate
-                    if b_idx < treetop_max_count {
-                        (&mut treetop.data[b_idx..b_idx + delta]).clone_from_slice(&data[..delta]);
-                        (&mut treetop.metadata[b_idx..b_idx + delta])
-                            .clone_from_slice(&meta[..delta]);
-                    }
-
-                    //save the oram buckets
-                    helpers::shuffle_push_buckets_ocall(
-                        shuffle_id,
-                        0,
-                        b_idx,
-                        e_idx,
-                        &data,
-                        &meta_plus_extra,
-                    );
+                    handlers_map
+                        .get(&tid.unwrap())
+                        .unwrap()
+                        .send((e_idx, e_count, cur_bin_num, bin_hashes, child_bin_hashes))
+                        .unwrap();
 
                     cur_bin_num -= 1;
-                    e_idx = b_idx;
+                    e_idx -= bin_size_in_bucket;
                 }
-                if e_count < count as usize {
-                    let h: Hash = prev_tier_hasher.finalize()[..16].try_into().unwrap();
-                    assert_eq!(prev_tier_hash, h);
+                while idle_threads.lock().unwrap().len() < NUM_THREADS {
+                    thread::sleep(Duration::from_micros(1000));
                 }
-                prev_tier_hash = cur_tier_hasher.finalize()[..16].try_into().unwrap();
+
+                prev_hashes = hashes;
+                hashes = Vec::new();
                 e_count = b_count;
                 b_count >>= 1;
-                ALLOCATOR.set_switch(true);
-                drop(prev_hashes);
-                prev_hashes = hashes;
-                hashes = vec![Default::default(); b_count];
-                ALLOCATOR.set_switch(false);
             }
         }
-        ALLOCATOR.set_switch(true);
-        drop(hashes);
-        drop(prev_hashes);
-        ALLOCATOR.set_switch(false);
+
+        drop(handlers_map);
+        for handler in handlers {
+            handler.join().unwrap();
+        }
     }
     let dur = now.elapsed().as_nanos() as f64 * 1e-9;
     println!("finish oram bucket push, {:?}s", dur);
 
     //build
     //handle the processed array to oram tree
+    std::mem::swap(oram_treetop, &mut *treetop.lock().unwrap());
+    std::mem::swap(
+        oram_trusted_merkle_roots,
+        &mut *trusted_merkle_roots.lock().unwrap(),
+    );
     unsafe {
         build_oram_from_shuffle_manager(shuffle_id, allocation_id);
     }
