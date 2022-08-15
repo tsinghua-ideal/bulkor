@@ -605,6 +605,18 @@ pub extern "C" fn build_oram_from_shuffle_manager(shuffle_id: u64, allocation_id
     }
     let _release_mem = unsafe { libc::malloc_trim(0) };
 
+    //update pointer
+    for idx in (0..storage.count).into_iter() {
+        let (sts_on_disk, _, mut p) = get_sts_ptr(&storage.ptrs, idx);
+        assert!(!sts_on_disk);
+        if idx < storage.count_in_mem {
+            p = p ^ 1;
+        } else {
+            p = (p + 1) % 3;
+        }
+        set_ptr(&mut storage.ptrs, idx, p);
+    }
+
     //no need to deal with ptr_file
     assert!(LEVEL_TO_ORAM_INST
         .lock()
@@ -1400,8 +1412,8 @@ pub extern "C" fn shuffle_pull_buckets(
 ) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
-        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
-            .as_mut()
+        (core::mem::transmute::<_, *const ShuffleManager>(shuffle_id))
+            .as_ref()
             .unwrap()
     };
     //TODO: may need lock
@@ -1468,8 +1480,8 @@ pub extern "C" fn shuffle_push_buckets_pre(
 ) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
-        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
-            .as_mut()
+        (core::mem::transmute::<_, *const ShuffleManager>(shuffle_id))
+            .as_ref()
             .unwrap()
     };
     let mut tmp_buf = manager.tmp_buf[tid].lock().unwrap();
@@ -1489,8 +1501,8 @@ pub extern "C" fn shuffle_push_buckets_pre(
 pub extern "C" fn shuffle_push_buckets(shuffle_id: u64, tid: usize, b_idx: usize, e_idx: usize) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
-        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
-            .as_mut()
+        (core::mem::transmute::<_, *const ShuffleManager>(shuffle_id))
+            .as_ref()
             .unwrap()
     };
     //TODO: may need lock
@@ -1512,8 +1524,8 @@ pub extern "C" fn shuffle_push_bin_pre(
 ) {
     assert_eq!(shuffle_id, SHUFFLE_MANAGER_ID.load(Ordering::SeqCst));
     let manager = unsafe {
-        (core::mem::transmute::<_, *mut ShuffleManager>(shuffle_id))
-            .as_mut()
+        (core::mem::transmute::<_, *const ShuffleManager>(shuffle_id))
+            .as_ref()
             .unwrap()
     };
     let mut tmp_buf = manager.tmp_buf[tid].lock().unwrap();

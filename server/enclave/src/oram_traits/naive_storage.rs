@@ -17,6 +17,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 
 /// The HeapORAMStorage is simply vector
+#[derive(Default)]
 pub struct HeapORAMStorage<BlockSize: ArrayLength<u8>, MetaSize: ArrayLength<u8>, Z: Unsigned> {
     /// The current level of recursive ORAM
     level: u32,
